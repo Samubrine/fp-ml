@@ -8,10 +8,10 @@ MODEL_DIR = os.path.join(OUTPUT_DIR, "models")
 PLOT_DIR = os.path.join(OUTPUT_DIR, "plots")
 METRIC_DIR = os.path.join(OUTPUT_DIR, "metrics")
 
-INPUT_CSV = os.path.join(DATA_DIR, "USDCHF_1min_3y.csv")
+INPUT_CSV = os.path.join(DATA_DIR, "USDCHF_1min_2020_2026.csv")
 
-TRAIN_CUTOFF = "2026-01-01"
-VAL_CUTOFF = "2026-03-15"
+TRAIN_CUTOFF = "2025-01-01"
+VAL_CUTOFF = "2025-09-01"
 TARGET_COL = "close"
 DROP_COLS = ["volume"]
 
