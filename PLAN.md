@@ -1,1369 +1,853 @@
-# USD/CHF Forex Forecasting — 3 Model Regression Implementation Plan
+# FP-ML: Notebook Implementation Specification
 
-> **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
+Target: forex_forecasting.ipynb | Language: English | Models: MLP+KNN+XGBoost | Sections: 7 | Estimated cells: ~70
 
-**Goal:** Implement & compare 3 regression models (KNN Regressor, SVR, XGBoost Regressor) untuk forecasting harga USD/CHF close price, menggunakan dataset 1-minute OHLCV dari histdata.com.
+## Global Dependencies
 
-**Architecture:** Modular pipeline: Data Load → Feature Engineering → Train/Val/Test Split → 3 Model Training + Tuning → Evaluation → Comparison Report.
+Shared imports: pandas, numpy, torch, torch.nn, torch.utils.data, sklearn.preprocessing (StandardScaler), sklearn.decomposition (PCA), sklearn.cluster (KMeans), sklearn.metrics, sklearn.feature_selection (mutual_info_regression), sklearn.model_selection (ParameterGrid), xgboost, matplotlib, seaborn, scipy.stats, statsmodels.tsa.stattools (adfuller), statsmodels.graphics.tsaplots (plot_acf), mplfinance, warnings, os, json, pickle, time, copy, itertools.
 
-**Tech Stack:** Python 3.14, pandas 3.0, numpy 2.4, scikit-learn, xgboost, matplotlib, seaborn, uv (package manager)
+Shared data files: data/processed/USDCHF_1min_2020_2026.csv (~119MB, 2,319,766 rows), outputs/preprocessed/data.pt (301MB, preprocessed tensors), outputs/plots/ directory for all saved figures.
 
-**Dataset:** `data/processed/USDCHF_1min_3y.csv` — 522,862 rows, columns: datetime, open, high, low, close, volume (all 0 → dropped). Range: 2025-01-01 to 2026-05-29.
+Shared variables: feature_cols (list of 34 feature name strings), chronological split dates (train_cutoff = 2025-01-01, val_cutoff = 2025-09-01), random seed = 42, device string (cuda or cpu).
 
----
+Shared model outputs: outputs/models/mlp_v2.pt, outputs/models/knn_v2.pkl, outputs/models/xgboost_v2.json, evals dict (per-model metrics), preds_dict (model_name → y_pred arrays).
 
-## Environment
-
-- **Project root:** `/home/bob/Documents/git/fp-ml`
-- **Venv:** `.venv/` (uv-managed, Python 3.14)
-- **Remote access:** `ssh bob@desktop-linux.netbird.selfhosted`
-- **Shell:** fish (use `.venv/bin/python3` directly, NOT `source .venv/bin/activate`)
+GPU/CPU fallback: ROCm 7.2 on AMD RX 9060 XT for GPU ops; fallback to CPU if torch.cuda.is_available() is False. XGBoost 3.1.1 (ROCm/xgboost fork) runs on AMD GPU via tree_method='hist', device='cuda'. KNN distance computation on GPU via torch.cdist with CPU fallback.
 
 ---
 
-## File Map (Final Structure)
+## Section 1: Project Description
 
-```
-fp-ml/
-├── data/
-│   └── processed/
-│       └── USDCHF_1min_3y.csv          # Input dataset
-├── src/
-│   ├── __init__.py
-│   ├── config.py                       # Constants: paths, hyperparam ranges
-│   ├── data_loader.py                  # Load & validate CSV
-│   ├── feature_engineering.py          # Lag, rolling, indicators, time features
-│   ├── data_splitting.py               # Chronological train/val/test split
-│   ├── train_knn.py                    # KNN Regressor training + tuning
-│   ├── train_svr.py                    # SVR training + tuning (with sampling)
-│   ├── train_xgboost.py                # XGBoost training + tuning
-│   ├── evaluate.py                     # Shared evaluation: RMSE, MAE, MAPE, plots
-│   ├── compare.py                      # Model comparison table + charts
-│   └── run_all.py                      # Master pipeline runner
-├── outputs/
-│   ├── models/                         # Saved model pickle files
-│   ├── plots/                          # Prediction vs actual, residuals
-│   └── metrics/                        # JSON/CSV metric tables
-└── .hermes/
-    └── plans/
-        └── 2026-06-11_forex-forecast-regression.md  # THIS FILE
-```
+### Block 1.1: Section Header — Project Identity
+- Type: section_header
+- Purpose: Orient reader — this is a group academic project on USD/CHF forex forecasting.
+- Input: None
+- Output: Markdown heading "1. Project Description" with subheading containing group member names, course/context, and GitHub repo link.
+- Visualization Spec: None
+- Narrative Content: None (structural only)
+- Dependencies: None
 
----
+### Block 1.2: Project Motivation — Why Forecast Forex?
+- Type: markdown_narrative
+- Purpose: Reader understands WHY this problem matters — both academically (model comparison under noise) and practically (forex is the world's largest financial market, $7.5T/day volume).
+- Input: None
+- Output: Narrative text establishing: forex market scale, difficulty of prediction (efficient market hypothesis, near-random-walk behavior), academic value of benchmarking diverse model architectures on real high-frequency data.
+- Visualization Spec: None
+- Narrative Content: Cover: (a) forex as largest liquid market, (b) EMH — prices should be unpredictable, (c) academic question: can any model extract signal from noise at 1-minute granularity? (d) practical relevance: algorithmic trading, market making, risk management. Do NOT introduce models yet — just the problem space.
+- Dependencies: Block 1.1
 
-# PHASE 0: ENVIRONMENT & PROJECT SETUP
+### Block 1.3: What Are We Predicting? — Target Definition
+- Type: markdown_narrative
+- Purpose: Reader understands the prediction target is 1-step-ahead log-return, NOT absolute price — and why this choice is critical.
+- Input: None
+- Output: Narrative defining the target variable: y_t = ln(close_{t+1} / close_t). Explanation of why log-return (stationarity) over absolute price (non-stationary, regime-dependent). One equation block: y_t = ln(P_{t+1} / P_t).
+- Visualization Spec: None
+- Narrative Content: Explain: (a) absolute price non-stationary across 6 years — trends, regime shifts destroy model generalization, (b) log-return approximately stationary (ADF test p < 0.001), (c) log-return is additive over time, (d) this is a REGRESSION task (predict magnitude + direction), not classification. Reference v1 failure: MLP R² = -3.26 on absolute price.
+- Dependencies: Block 1.2
 
----
+### Block 1.4: Dataset Origin and Structure
+- Type: markdown_narrative
+- Purpose: Reader knows exactly what data is used, where it came from, its dimensions, and its schema.
+- Input: None
+- Output: Narrative describing: source (histdata.com), file path (data/processed/USDCHF_1min_2020_2026.csv), row count (2,319,766), date range (2020-01-01 → 2026-05-29), columns (datetime, open, high, low, close, volume=0, tick_volume, spread), file size (~119MB). Notes volume column is always 0 in forex data and will be dropped.
+- Visualization Spec: None
+- Narrative Content: State: (a) free historical forex data from histdata.com, (b) 1-minute OHLC bars, (c) 2.3M+ rows spanning ~6 years, (d) USD/CHF pair — one of the major forex pairs, (e) note that tick_volume and spread columns exist but are not used as features.
+- Dependencies: Block 1.1
 
-## Task 0.1: Install ML dependencies via uv
+### Block 1.5: Time Series Characteristics — Regime Shifts
+- Type: markdown_narrative
+- Purpose: Reader understands the non-stationary nature of the raw price series across the 6-year window — bullish and bearish regimes.
+- Input: None
+- Output: Narrative describing 4 distinct price regimes: bullish 2020-2021 (USD strength vs CHF), sideways 2022-2024 (consolidation), bullish early 2025 (breakout), bearish late 2025-2026 (decline). Explains why this motivates log-return transformation and chronological (not random) splitting.
+- Visualization Spec: None
+- Narrative Content: Describe each regime qualitatively. Connect to Block 1.3: these regime shifts are WHY absolute price fails and log-return is necessary. Connect to chronological split: chronological split respects these temporal boundaries.
+- Dependencies: Block 1.3, Block 1.4
 
-**Action:**
-```bash
-cd /home/bob/Documents/git/fp-ml && .venv/bin/uv pip install scikit-learn xgboost matplotlib seaborn
-```
+### Block 1.6: Feature Engineering — 34 Inputs
+- Type: markdown_narrative
+- Purpose: Reader understands the breadth of engineered features before seeing any code — what categories exist and why each matters.
+- Input: None
+- Output: Narrative enumerating 4 feature families: (a) 8 lag features — close_lag_1..60, captures autocorrelation, (b) 16 rolling statistics — close_roll_{mean,std,min,max}_{5,10,30,60}, captures local volatility and trend, (c) 4 price-derived — log_return, pct_change, hl_spread, oc_range, captures intra-bar dynamics, (d) 6 technical indicators — rsi_14, macd_hist, bb_position_20, bb_width_20, atr_14, captures momentum and volatility regimes. Total: 34 features, each row is a 1-minute observation.
+- Visualization Spec: None
+- Narrative Content: For each family, explain in 1-2 sentences what it measures and why it might help predict next-minute movement. No formulas needed here — save those for the preprocessing section.
+- Dependencies: Block 1.3
 
-**Verify:**
-```bash
-.venv/bin/python3 -c "import sklearn; import xgboost; import matplotlib; import seaborn; print('ALL OK')"
-```
+### Block 1.7: Experimental Design — Chronological Split
+- Type: markdown_narrative
+- Purpose: Reader understands the train/val/test split boundaries and WHY chronological (no shuffle) is mandatory for time series.
+- Input: None
+- Output: Narrative with split table: Train (< 2025-01-01, ~1.8M rows), Validation (2025-01-01 → 2025-09-01, ~247K rows), Test (≥ 2025-09-01, ~276K rows). Explanation of look-ahead bias if shuffled. Connection to real-world deployment: models are tested on truly unseen future data.
+- Visualization Spec: None
+- Narrative Content: Define look-ahead bias. Explain why sklearn's default train_test_split(shuffle=True) is catastrophic for time series. State the exact cutoff dates. Note that these boundaries align with natural regime boundaries (sideways → bullish in early 2025, bullish → bearish in late 2025).
+- Dependencies: Block 1.4, Block 1.5
 
-**Expected:** `ALL OK`
+### Block 1.8: Three Models — Architecture Overview
+- Type: markdown_narrative
+- Purpose: Reader knows WHAT three models are compared and WHY this specific trio was chosen — different learning paradigms (neural, instance-based, tree ensemble).
+- Input: None
+- Output: Narrative introducing: (1) MLP — deep neural network, 34→1024→512→256→128→1, GPU-accelerated, non-linear function approximator, (2) KNN — k-nearest neighbors with k=50, GPU batched distance computation, non-parametric, (3) XGBoost — gradient-boosted trees, 65 trees, GPU histogram method (ROCm), state-of-the-art tabular model. One sentence per model on what class of algorithm it represents.
+- Visualization Spec: None
+- Narrative Content: Frame as a comparison across three paradigms: deep learning, lazy learning, and gradient boosting. State that all three predict the SAME log-return target on the SAME train/val/test split using the SAME 34 features and StandardScaler — the comparison is apples-to-apples.
+- Dependencies: Block 1.3, Block 1.6, Block 1.7
 
----
+### Block 1.9: Evaluation Framework — Five Metrics
+- Type: markdown_narrative
+- Purpose: Reader knows exactly how model performance is measured — 5 metrics covering error magnitude, explained variance, relative error, directional accuracy, and classification quality.
+- Input: None
+- Output: Narrative defining: RMSE (root mean squared error, penalizes large errors), MAE (mean absolute error, robust), R² (coefficient of determination, how much variance explained vs naive mean), MAPE (mean absolute percentage error, scale-independent), DirAcc (directional accuracy — % of times predicted sign matches actual sign). Equation for R²: R² = 1 - SS_res / SS_tot. Note: R² can be negative — model worse than always predicting the mean.
+- Visualization Spec: None
+- Narrative Content: Explain each metric's interpretation. Emphasize: (a) in noisy forex data, R² close to 0 is actually GOOD — random walk R² ≈ 0, negative R² means model is worse than guessing the mean, (b) DirAcc ~50% is random guessing, >50% is signal, (c) MAPE < 0.01% means predictions are extremely close to actual log-returns.
+- Dependencies: Block 1.3
 
-## Task 0.2: Create project directories
+### Block 1.10: Three Experimental Scenarios
+- Type: markdown_narrative
+- Purpose: Reader understands the notebook evaluates models across three complementary lenses: regression performance, directional classification, and market regime analysis.
+- Input: None
+- Output: Narrative describing: Scenario 1 — regression evaluation (RMSE, MAE, R², MAPE; residual analysis; actual-vs-predicted plots), Scenario 2 — directional classification (discretize predictions to Up/Down; confusion matrix; precision/recall/F1 per direction), Scenario 3 — market regime robustness (K-Means clustering on features to identify volatility/trend regimes; evaluate if model errors concentrate in specific regimes; PCA visualization colored by regime and error).
+- Visualization Spec: None
+- Narrative Content: Frame each scenario as answering a different question: (1) "How well does it predict?" (2) "Does it get the direction right?" (3) "Does it work in all market conditions?" This foreshadows the notebook's evaluation structure.
+- Dependencies: Block 1.8, Block 1.9
 
-**Action:**
-```bash
-mkdir -p /home/bob/Documents/git/fp-ml/src
-mkdir -p /home/bob/Documents/git/fp-ml/outputs/models
-mkdir -p /home/bob/Documents/git/fp-ml/outputs/plots
-mkdir -p /home/bob/Documents/git/fp-ml/outputs/metrics
-```
-
-**Verify:**
-```bash
-ls -d /home/bob/Documents/git/fp-ml/src /home/bob/Documents/git/fp-ml/outputs/*
-```
-
----
-
-## Task 0.3: Create `src/__init__.py`
-
-**Create:** `src/__init__.py`
-```python
-"""USD/CHF Forex Forecasting — ML Regression Models."""
-```
-
-**Verify:**
-```bash
-cat /home/bob/Documents/git/fp-ml/src/__init__.py
-```
-
----
-
-# PHASE 1: CONFIG FILE
-
----
-
-## Task 1.1: Create `src/config.py`
-
-**Create:** `src/config.py` — Centralised constants and paths.
-
-```python
-"""Centralised constants and paths for the USD/CHF forecasting project."""
-import os
-
-# ── Paths ──────────────────────────────────────────────────────────────
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(ROOT_DIR, "data", "processed")
-OUTPUT_DIR = os.path.join(ROOT_DIR, "outputs")
-MODEL_DIR = os.path.join(OUTPUT_DIR, "models")
-PLOT_DIR = os.path.join(OUTPUT_DIR, "plots")
-METRIC_DIR = os.path.join(OUTPUT_DIR, "metrics")
-
-INPUT_CSV = os.path.join(DATA_DIR, "USDCHF_1min_3y.csv")
-
-# ── Data ───────────────────────────────────────────────────────────────
-TRAIN_CUTOFF = "2026-01-01"           # ~78% train
-VAL_CUTOFF = "2026-03-15"             # ~11% val  (rest=test)
-TARGET_COL = "close"                  # What we're predicting
-DROP_COLS = ["volume"]                # All-zero in our dataset
-
-# ── Feature Engineering ────────────────────────────────────────────────
-LAG_PERIODS = [1, 2, 3, 5, 10, 15, 30, 60]  # Minutes back
-ROLLING_WINDOWS = [5, 10, 30, 60]   # Minutes for rolling stats
-ROLLING_STATS = ["mean", "std", "min", "max"]
-LOOKAHEAD = 1  # Predict close at t+LOOKAHEAD (1-minute ahead)
-
-# ── KNN ────────────────────────────────────────────────────────────────
-KNN_PARAM_GRID = {
-    "n_neighbors": [3, 5, 10, 20, 50, 100],
-    "weights": ["uniform", "distance"],
-    "p": [1, 2],  # 1=manhattan, 2=euclidean
-}
-
-# ── SVR ────────────────────────────────────────────────────────────────
-SVR_SAMPLE_SIZE = 50_000              # SVR O(n²) — must subsample
-SVR_PARAM_GRID = {
-    "C": [0.1, 1, 10, 100],
-    "gamma": ["scale", "auto", 0.001, 0.01, 0.1],
-    "epsilon": [0.001, 0.01, 0.1],
-}
-
-# ── XGBoost ────────────────────────────────────────────────────────────
-XGB_PARAM_GRID = {
-    "n_estimators": [100, 300, 500],
-    "max_depth": [3, 5, 7, 10],
-    "learning_rate": [0.01, 0.1, 0.3],
-    "subsample": [0.7, 0.8, 1.0],
-    "colsample_bytree": [0.7, 0.8, 1.0],
-}
-
-# ── General ────────────────────────────────────────────────────────────
-RANDOM_SEED = 42
-CV_FOLDS = 3  # TimeSeriesSplit — keep small for speed
-```
-
-**Verify:**
-```bash
-cd /home/bob/Documents/git/fp-ml && .venv/bin/python3 -c "from src.config import *; print('Config OK'); print('INPUT_CSV:', INPUT_CSV)"
-```
-
-**Expected:** `Config OK` with correct path.
+### Block 1.11: Project Deliverables and Reproducibility
+- Type: markdown_narrative
+- Purpose: Reader knows what artifacts exist, where they are, and how to reproduce results.
+- Input: None
+- Output: Narrative listing: (a) GitHub repo Samubrine/fp-ml, (b) main notebook forex_forecasting.ipynb (46 cells, Run All = full pipeline), (c) preprocessed data outputs/preprocessed/data.pt (301MB), (d) trained models mlp_v2.pt, knn_v2.pkl, xgboost_v2.json, (e) results JSONs and comparison chart outputs/plots/v2_comparison.png, (f) standalone training scripts in src/. Notes total runtime ~30 minutes and hardware (AMD RX 9060 XT, ROCm 7.2).
+- Visualization Spec: None
+- Narrative Content: Conclude by stating the notebook is self-contained — all preprocessing, training, evaluation, and visualization happens inline. No external data dependencies beyond the CSV. Full reproducibility instructions in README/PLAN2.md.
+- Dependencies: Block 1.1, Block 1.4
 
 ---
 
-# PHASE 2: DATA LOADER
+## Section 2: Exploratory Data Analysis
+
+### Block 2.1: Load Raw Data
+- Type: code_output
+- Purpose: Reader learns the CSV file's path, read mechanism, and row count.
+- Input: CSV file at data/processed/USDCHF_1min_2020_2026.csv
+- Output: DataFrame df with ~2.3M rows, columns: datetime, open, high, low, close, volume, tick_volume, spread
+- Visualization Spec: N/A
+- Narrative Content: N/A
+- Dependencies: None
+
+### Block 2.2: Data Structure Overview
+- Type: table
+- Purpose: Reader sees the schema at a glance — column names, dtypes, example values, and non-null counts in a single spec table.
+- Input: df
+- Output: Rendered table data_spec with columns: Column Name, Dtype, Non-Null Count, 3 Example Values
+- Visualization Spec: N/A
+- Narrative Content: N/A
+- Dependencies: Block 2.1
+
+### Block 2.3: What the Columns Mean
+- Type: markdown_narrative
+- Purpose: Reader understands the domain meaning of each column (OHLC bar, tick volume vs real volume, spread) and why this is forex tick data.
+- Input: Column names from Block 2.2
+- Output: N/A (inline markdown)
+- Narrative Content: Explain OHLCV bar terminology. Define tick_volume as number of price updates in that minute (not monetary volume). Define spread as bid-ask spread in pips at bar close. Clarify that volume is near-zero because forex has no central exchange — this is a data quirk, not a bug. Note 1-minute granularity. Mention the 2020–2026 period (~6 years).
+- Dependencies: Block 2.2
+
+### Block 2.4: Missing Value Audit
+- Type: table
+- Purpose: Reader sees exactly where and how many values are missing, both as absolute counts and percentages, to decide on imputation or drop strategies later.
+- Input: df
+- Output: Rendered table missing_report with columns: Column, Missing Count, Missing %, Note (e.g., "market close gaps")
+- Visualization Spec: N/A
+- Narrative Content: N/A
+- Dependencies: Block 2.1
+
+### Block 2.5: Missing Value Patterns
+- Type: markdown_narrative
+- Purpose: Reader understands that missing values are not random — they cluster at weekends and market close hours, which matters for time-series imputation.
+- Input: missing_report from Block 2.4, df
+- Output: N/A (inline markdown)
+- Narrative Content: Explain the forex market 24/5 schedule. Missing rows correspond to weekends (Saturday–Sunday UTC) and daily broker reset windows. This is structurally missing data, not random. Implication: forward-fill or time-aware imputation is appropriate; mean imputation is not.
+- Dependencies: Block 2.4
+
+### Block 2.6: Descriptive Statistics
+- Type: table
+- Purpose: Reader sees the central tendency, dispersion, and range of every numeric column to spot outliers and understand typical magnitudes.
+- Input: df
+- Output: Rendered table desc_stats with rows per column, columns: count, mean, std, min, 25%, 50%, 75%, max
+- Visualization Spec: N/A
+- Narrative Content: N/A
+- Dependencies: Block 2.1
+
+### Block 2.7: Interpreting the Stats
+- Type: markdown_narrative
+- Purpose: Reader connects raw statistics to trading intuition — typical daily ranges, spread costs, tick frequency.
+- Input: desc_stats from Block 2.6
+- Output: N/A (inline markdown)
+- Narrative Content: Highlight: mean close for USD/CHF in the 0.90–1.00 range (USD/CHF typical levels), std captures multi-year dispersion. Volume mean near zero confirms tick-data quirk. tick_volume ~10–50 per minute indicates typical activity. Spread ~0–2 pips — note max spread spikes during news/rollover. Remind reader that min/max of close are the multi-year extremes.
+- Dependencies: Block 2.6
+
+### Block 2.8: Full-Period Price Series
+- Type: visualization
+- Purpose: Reader sees the entire 6-year price trajectory to grasp the USD/CHF macro trend (COVID crash, recovery, range-bound years).
+- Input: df['datetime'], df['close']
+- Output: Displayed figure
+- Visualization Spec: Line plot, x = datetime (2020-01 to 2026), y = close price, single dark blue line, light gray background, title "USD/CHF Close Price — Full Period (2020–2026)", y-axis labeled "Price (CHF per USD)". Optionally shade major events (COVID March 2020, Ukraine Feb 2022) with vertical annotation bands.
+- Dependencies: Block 2.1
+
+### Block 2.9: One-Year Zoom (2025)
+- Type: visualization
+- Purpose: Reader inspects a recent year at higher resolution to see intra-year trends, volatility clusters, and the granularity of 1-minute data.
+- Input: df['datetime'] filtered to 2025, df['close'] filtered to 2025
+- Output: Displayed figure
+- Visualization Spec: Line plot, x = datetime (2025-01-01 to 2025-12-31), y = close price, single dark blue line, title "USD/CHF Close Price — 2025 Zoom", y-axis "Price (CHF per USD)". No smoothing — raw 1-minute line shows true density.
+- Dependencies: Block 2.8
+
+### Block 2.10: Zoom Interpretation
+- Type: markdown_narrative
+- Purpose: Reader learns to read the 2025 zoom — visible weekend gaps, intraday oscillation, and volatility regime shifts.
+- Input: Visualizations from Blocks 2.8 and 2.9
+- Output: N/A (inline markdown)
+- Narrative Content: Point out: (1) vertical gaps every weekend where no data exists, (2) intraday price movement is clearly visible at 1-min granularity, (3) volatility is not constant — there are calm periods and turbulent clusters. Tie this to why a model must handle non-stationarity and irregular sampling.
+- Dependencies: Block 2.9
+
+### Block 2.11: Daily OHLC Candlestick Sample
+- Type: visualization
+- Purpose: Reader sees the classic candlestick representation and understands how OHLC bars aggregate intra-minute data into tradeable signals.
+- Input: df resampled to daily (df_daily with columns: datetime, open, high, low, close)
+- Output: Displayed figure
+- Visualization Spec: Candlestick chart (or OHLC bar chart), x = datetime (subset: last 90 trading days for legibility), green candles for close > open, red for close < open, title "USD/CHF Daily Candlesticks — Last 90 Trading Days", y-axis "Price (CHF per USD)". Use mplfinance-style rendering.
+- Dependencies: Block 2.1
+
+### Block 2.12: One-Minute Return Distribution
+- Type: visualization
+- Purpose: Reader sees the empirical distribution of 1-minute log returns — its shape, tails, and whether it approximates a normal distribution.
+- Input: df['close']
+- Output: Displayed figure, variable returns_1m (Series of log returns)
+- Visualization Spec: Histogram with KDE overlay, x = 1-minute log return (pct), y = density, 200 bins, navy histogram bars with 0.5 alpha, orange KDE line, vertical dashed red line at mean (near zero), title "1-Minute Log Return Distribution", x-axis "Log Return", y-axis "Density". Overlay a normal distribution (black dashed) with same mean/std for visual comparison.
+- Dependencies: Block 2.1
+
+### Block 2.13: Return Distribution Interpretation
+- Type: markdown_narrative
+- Purpose: Reader understands the stylized facts of financial returns visible in the histogram: fat tails, excess kurtosis, volatility clustering, and why normality assumptions fail.
+- Input: returns_1m from Block 2.12, histogram from Block 2.12
+- Output: N/A (inline markdown)
+- Narrative Content: Explain: (1) mean ≈ 0 (no drift at 1-min scale), (2) distribution is peaked (leptokurtic) — more density near zero than normal, (3) fat tails — extreme moves happen more often than a normal distribution predicts, (4) these are universal stylized facts of financial returns. Implication: MSE-based models assume normality; this mismatch matters for risk estimation. Note that tick data amplifies microstructure noise at this frequency.
+- Dependencies: Block 2.12
 
 ---
 
-## Task 2.1: Create `src/data_loader.py`
+## Section 3: Preprocessing and Feature Engineering
 
-**Create:** `src/data_loader.py`
+### Block 3.1: Load Raw OHLC Data
+- Type: code_output
+- Purpose: Reader learns the raw data structure — 2.3M rows of 1-min USD/CHF with datetime index, 4 price columns, meaningless volume.
+- Input: data/processed/USDCHF_1min_2020_2026.csv
+- Output: df (DataFrame, datetime-indexed, columns: open, high, low, close), volume dropped, date_range displayed (2020-01-01 → 2026-05-29)
+- Dependencies: none
 
-```python
-"""Load, validate, and return the USD/CHF 1-minute dataset."""
-import pandas as pd
-from src.config import INPUT_CSV, DROP_COLS, TARGET_COL
+### Block 3.2: Log-Return Target — Definition and Computation
+- Type: markdown_narrative
+- Purpose: Reader learns why absolute price failed catastrophically (non-stationarity across 6 years), and why log-return ln(close_{t+1} / close_t) solves it via approximate stationarity and scale invariance.
+- Narrative Content: Explain v1 failure: MLP R² = -3.26 with absolute price target because price level drifts across regime shifts (2020-21 bullish, 2022-24 sideways, 2025-26 bearish). Log-return removes trend: y_t = ln(close_{t+1} / close_t). Properties: mean ≈ 0, variance roughly constant, dimensionless → model doesn't need to learn absolute scale. Equation: target = log(close.shift(-1) / close). Note: last row gets NaN (no t+1). This makes forecasting a zero-mean prediction problem.
+- Dependencies: Block 3.1
 
+### Block 3.3: Compute Log-Return Target
+- Type: code_output
+- Purpose: Compute and append target column to df — ln(close_{t+1} / close_t).
+- Input: df.close
+- Output: df['target'] (float64, ~2.3M rows, last row NaN)
+- Dependencies: Block 3.1, Block 3.2
 
-def load_data(csv_path: str = INPUT_CSV) -> pd.DataFrame:
-    """Load CSV, parse datetime index, drop useless columns, validate.
+### Block 3.4: ADF Stationarity Test on Target
+- Type: code_output
+- Purpose: Empirically confirm the target is stationary — Augmented Dickey-Fuller test prints test statistic and p-value. p < 0.001 → reject unit root null → target is stationary, validating the log-return transformation.
+- Input: df['target'] (non-NaN)
+- Output: printed ADF statistic and p-value (e.g. "ADF Statistic: -74.32, p-value: 0.0000")
+- Dependencies: Block 3.3
 
-    Returns:
-        DataFrame with DatetimeIndex, sorted ascending.
-    """
-    # 1. Read CSV
-    df = pd.read_csv(csv_path)
+### Block 3.5: Lag Features (8 Features)
+- Type: code_output
+- Purpose: Create 8 lag features close_lag_k for k ∈ {1,2,3,5,10,15,30,60} — past close prices shifted backward by k minutes. Captures short-term momentum and mean-reversion signals at exponentially increasing horizons.
+- Input: df.close
+- Output: 8 columns added to df: close_lag_1, close_lag_2, close_lag_3, close_lag_5, close_lag_10, close_lag_15, close_lag_30, close_lag_60 (each with NaN in first k rows)
+- Dependencies: Block 3.3
 
-    # 2. Parse datetime & set as index
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df.set_index("datetime", inplace=True)
-    df.sort_index(inplace=True)
+### Block 3.6: Rolling Window Statistics (16 Features)
+- Type: code_output
+- Purpose: Compute 4 aggregated stats (mean, std, min, max) over 4 windows (5, 10, 30, 60 minutes) on close. Captures local trend, volatility, support/resistance levels at multiple timescales. Uses .rolling(window).agg([...]) with min_periods=1.
+- Input: df.close
+- Output: 16 columns added to df: close_roll_mean_5, close_roll_std_5, close_roll_min_5, close_roll_max_5, ..._10, ..._30, ..._60
+- Dependencies: Block 3.5
 
-    # 3. Drop columns that add no value
-    df.drop(columns=DROP_COLS, inplace=True, errors="ignore")
+### Block 3.7: Price-Derived Features (4 Features)
+- Type: code_output
+- Purpose: Create 4 interpretable price-ratio features that don't need windows: log_return (instantaneous), pct_change, hl_spread = (high - low)/close (intra-bar volatility), oc_range = (close - open)/close (bar direction and magnitude). All are scale-invariant, immune to absolute price drift.
+- Input: df.open, df.high, df.low, df.close
+- Output: 4 columns added to df: log_return, pct_change, hl_spread, oc_range
+- Dependencies: Block 3.6
 
-    # 4. Validate — no NaNs in critical columns
-    assert df.isnull().sum().sum() == 0, "NaN values found in dataset"
-    assert len(df) > 100_000, "Dataset too small: {n} rows".format(n=len(df))
+### Block 3.8: Technical Indicators (5 Features)
+- Type: code_output
+- Purpose: Compute 5 classic indicators: rsi_14 (momentum oscillator, 0-100), macd_hist (trend-following, 12-26-9 EMA), bb_position_20 and bb_width_20 (volatility bands, SMA ± 2σ), atr_14 (true range volatility). Provides domain-standard signals traders use.
+- Input: df.close, df.high, df.low
+- Output: 5 columns added to df: rsi_14, macd_hist, bb_position_20, bb_width_20, atr_14
+- Dependencies: Block 3.7
 
-    # 5. Ensure numeric types
-    for c in [TARGET_COL, "open", "high", "low"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df.dropna(inplace=True)
+### Block 3.9: Drop NaN Rows — Feature Completeness
+- Type: code_output
+- Purpose: Remove rows where any feature or target is NaN (from rolling windows, lags, indicators, and last-row target). Reports how many rows remain (~2.0M out of 2.3M). Justification: models require complete feature vectors; alternatives (imputation) would leak future information in time series.
+- Input: df (all 34 feature columns + target)
+- Output: df (cleaned, ~2.0M rows), printed dropped_count and remaining_count
+- Dependencies: Block 3.8
 
-    return df
+### Block 3.10: Chronological Train/Validation/Test Split
+- Type: markdown_narrative
+- Purpose: Reader learns why time-series data MUST NOT be shuffled, and how chronological splitting prevents look-ahead bias — models see only past data to predict future, mirroring real deployment.
+- Narrative Content: Explain data leakage: if you shuffle, a model can "see" future patterns in training → inflated validation metrics, worthless in production. Chronological split: all timestamps before cutoff go to train, after to val/test. Cutoffs chosen to balance regime coverage: train spans 2020-2024 (bull + sideways), val spans Jan-Sep 2025 (bullish), test spans Sep 2025+ (bearish) — this is hard on purpose, testing generalization across a regime change.
+- Dependencies: Block 3.9
 
+### Block 3.11: Execute Chronological Split
+- Type: code_output
+- Purpose: Split df into X_train, ytr (< 2025-01-01), X_val, yva (2025-01-01 to 2025-09-01), X_test, yte (≥ 2025-09-01). Print row counts: ~1.8M / ~247K / ~276K. Define feature_cols list (34 column names) and separate features from target.
+- Input: df (cleaned), cutoffs 2025-01-01, 2025-09-01, feature_cols list
+- Output: X_train, ytr, X_val, yva, X_test, yte (all float64, no index leakage to features), feature_cols (list of 34 strings), printed split sizes
+- Dependencies: Block 3.9, Block 3.10
 
-if __name__ == "__main__":
-    df = load_data()
-    print("Loaded: {n:,} rows".format(n=len(df)))
-    print("Range:  {start}  →  {end}".format(start=df.index.min(), end=df.index.max()))
-    print("Nulls:  {n}".format(n=df.isnull().sum().sum()))
-    print(df.head())
-```
+### Block 3.12: VIF Multicollinearity Table
+- Type: table
+- Purpose: Detect multicollinearity among the 34 features. Variance Inflation Factor > 10 flags problematic redundancy; helps reader understand which features carry independent signal. Computed on training set only to avoid data leakage.
+- Visualization Spec: Table: column 1 = feature name, column 2 = VIF value. Sorted descending. Color-code: green (VIF < 5), yellow (5-10), red (> 10). Title: "Variance Inflation Factor — Training Set Features"
+- Input: X_train (34 features)
+- Output: printed VIF table (34 rows × 2 columns)
+- Dependencies: Block 3.11
 
-**Verify:**
-```bash
-cd /home/bob/Documents/git/fp-ml && .venv/bin/python3 -m src.data_loader
-```
+### Block 3.13: Mutual Information Ranking
+- Type: visualization
+- Purpose: Rank 34 features by mutual information with target — measures nonlinear dependency, complementary to Pearson correlation. Highest MI features are most predictive; low-MI features may be candidates for removal in future iterations.
+- Visualization Spec: Horizontal bar chart, x = mutual information score, y = feature names (sorted descending), color = blue gradient (darker = higher MI). Title: "Mutual Information with Log-Return Target (Training Set)"
+- Input: X_train, ytr
+- Output: printed MI scores + bar chart; mi_scores dict mapping feature name → score
+- Dependencies: Block 3.12
 
-**Expected:**
-```
-Loaded: 522,862 rows
-Range:  2025-01-01 17:04:00  →  2026-05-29 16:58:00
-Nulls:  0
-```
+### Block 3.14: StandardScaler Normalization
+- Type: code_output
+- Purpose: Zero-center and unit-variance scale all 34 features. Fit μ and σ on training set ONLY (prevents look-ahead), then transform train, val, test with same parameters. Critical for gradient-based models (MLP) and distance-based models (KNN).
+- Input: X_train, X_val, X_test
+- Output: X_train_scaled, X_val_scaled, X_test_scaled (all float32, zero-mean unit-variance), scaler_mean_ (34 floats), scaler_scale_ (34 floats)
+- Dependencies: Block 3.13
+
+### Block 3.15: Save Preprocessed Tensors to data.pt
+- Type: code_output
+- Purpose: Persist preprocessed pipeline output as a single .pt file for model scripts to consume without re-running preprocessing (saves 2-3 min per model run). Contains all scaled tensors, feature names, and scaler parameters for inverse-transform during evaluation.
+- Input: X_train_scaled, X_val_scaled, X_test_scaled, ytr, yva, yte, feature_cols, scaler_mean_, scaler_scale_
+- Output: outputs/preprocessed/data.pt (301MB) containing dict: {'X_train': tensor, 'y_train': tensor, 'X_val': tensor, 'y_val': tensor, 'X_test': tensor, 'y_test': tensor, 'feature_names': list, 'scaler_mean': tensor, 'scaler_scale': tensor}
+- Dependencies: Block 3.14
 
 ---
 
-# PHASE 3: FEATURE ENGINEERING
+## Section 4: Model Training
+
+### Block 4.1: Data Splitting Strategy
+- Type: markdown_narrative
+- Purpose: Reader understands why a fixed train/val/test split with seed=42 is essential for fair model comparison.
+- Input: None (conceptual, referencing the full feature matrix and targets loaded in prior sections)
+- Output: None (sets up the split that produces X_train, ytr, X_val, yva, X_test, yte)
+- Visualization Spec: None
+- Narrative Content: Explain the 3-way split (train/val/test) and why all models must share identical splits. Cover the role of the validation set for hyperparameter tuning and early stopping, the test set held out until final evaluation, and the importance of seed=42 for reproducibility. Mention that the split was already executed in a prior section so the variable names X_train, ytr, X_val, yva, X_test, yte are now available.
+- Dependencies: None (references split already done before this section)
+
+### Block 4.2: MLP Architecture Overview
+- Type: markdown_narrative
+- Purpose: Reader learns the MLP's layer-by-layer architecture before seeing code — width progression, normalization, activation, regularization, and why ~728K parameters is appropriate.
+- Input: feature_cols (34 input features from data prep section)
+- Output: None (conceptual setup for MLP training blocks)
+- Visualization Spec: None
+- Narrative Content: Describe the MLP as a deep feedforward network: input layer (34 features) → hidden layers [1024, 512, 256, 128] → output (1). Explain each architectural choice: BatchNorm1d after each linear layer for training stability, ReLU for non-linearity, Dropout(0.15) for regularization. Note total parameter count (~728K) and why this depth/width balances capacity against overfitting on tabular data. Mention the final layer has no activation (raw regression output).
+- Dependencies: Block 4.1 (references feature_cols dimension)
+
+### Block 4.3: MLP Training Configuration
+- Type: markdown_narrative
+- Purpose: Reader understands the optimizer, scheduler, precision, batch size, and early stopping choices — the full training recipe.
+- Input: None (conceptual)
+- Output: None (sets up MLP training loop semantics)
+- Visualization Spec: None
+- Narrative Content: Explain each hyperparameter choice: AdamW(lr=0.001, wd=1e-4) — why weight decay decoupled from Adam, why 0.001 is a reasonable starting LR for this architecture. CosineAnnealingWarmRestarts — what warm restarts do to escape local minima, how cosine schedule cycles. AMP (float16) — mixed precision training halves memory and speeds GPU computation with negligible accuracy loss. Batch size 65536 — why massive batches work well on tabular data with GPU, how it stabilizes gradient estimates. Early stopping patience=15 on val loss — what patience means, how the best model checkpoint is saved. 150 max epochs — ceiling if early stop never triggers.
+- Dependencies: Block 4.2 (architecture context needed to motivate optimizer/scheduler choices)
+
+### Block 4.4: MLP Training Loop Setup
+- Type: code_output
+- Purpose: Reader sees the concrete instantiation of model, loss function, optimizer, scheduler, scaler, and dataloaders — all objects needed before the loop runs.
+- Input: X_train, ytr, X_val, yva (from Block 4.1 split); feature_cols (input dimension)
+- Output: model (MLP instance on GPU), criterion (MSELoss), optimizer (AdamW), scheduler (CosineAnnealingWarmRestarts), scaler (GradScaler for AMP), train_loader and val_loader (DataLoader with batch_size=65536), best_val_loss (initialized to inf), patience_counter (initialized to 0), best_model_state (None, to hold checkpoint)
+- Visualization Spec: None
+- Dependencies: Block 4.1 (split data), Block 4.2 (architecture), Block 4.3 (hyperparameters)
+
+### Block 4.5: MLP Training Loop Execution
+- Type: code_output
+- Purpose: Reader observes the per-epoch training dynamics — forward/backward pass with AMP, loss tracking, validation, checkpointing, and early stopping logic.
+- Input: model, criterion, optimizer, scheduler, scaler, train_loader, val_loader, best_val_loss, patience_counter, best_model_state (all from Block 4.4)
+- Output: train_losses (list of per-epoch training loss), val_losses (list of per-epoch validation loss), best_epoch (int, epoch where best val loss occurred), best_model_state (updated dict with best checkpoint weights), actual_epochs_run (int, number of epochs before early stop)
+- Visualization Spec: None (raw data produced; visualization is Block 4.6)
+- Dependencies: Block 4.4 (all inputs defined there)
+
+### Block 4.6: MLP Training Curves
+- Type: visualization
+- Purpose: Reader visually diagnoses training — convergence speed, overfitting onset, and where early stopping fired.
+- Input: train_losses, val_losses, best_epoch (from Block 4.5)
+- Output: Displayed figure inline in notebook
+- Visualization Spec: Dual line plot. x-axis = epoch (1 to actual_epochs_run). y-axis = MSE loss. Blue solid line = training loss (train_losses). Orange solid line = validation loss (val_losses). Vertical dashed red line at x = best_epoch. Title: "MLP Training Curves". Legend in upper right. Grid on. Annotation on red line: "Early stop at epoch {best_epoch}".
+- Dependencies: Block 4.5 (loss arrays and best_epoch)
+
+### Block 4.7: KNN Architecture Overview
+- Type: markdown_narrative
+- Purpose: Reader understands that KNN is a lazy learner — no training phase, prediction is inference-time nearest-neighbor averaging — and why GPU-accelerated distance computation matters at scale.
+- Input: None (conceptual)
+- Output: None (sets up KNN blocks)
+- Visualization Spec: None
+- Narrative Content: Contrast KNN with MLP: no weights, no gradient descent, no epochs. "Training" is simply storing the training set. Prediction: for a query point, compute distances to all stored training points, find the k nearest, return the mean of their targets. Explain why brute-force cdist on ~1.8M rows is infeasible per query → subsample 100K train rows for manageable inference. Explain GPU batched cdist (torch.cdist on GPU) for parallel distance computation. Describe the k-value sweep: k ∈ [1,3,5,7,10,15,20,30,50] to study bias-variance tradeoff. Note: val set queries batched at 5000 rows to balance memory.
+- Dependencies: Block 4.1 (references X_train, ytr size to motivate subsampling)
+
+### Block 4.8: KNN Subsample and k-Value Sweep
+- Type: code_output
+- Purpose: Reader sees the random subsample of training data and the loop over k values computing validation predictions and MSE.
+- Input: X_train, ytr, X_val, yva (from Block 4.1)
+- Output: X_knn_train (100K-row subsample), y_knn_train (corresponding targets), knn_k_list ([1,3,5,7,10,15,20,30,50]), knn_val_results (dict mapping k → val MSE), knn_best_k (int, k with lowest val MSE)
+- Visualization Spec: None
+- Dependencies: Block 4.1 (train/val data), Block 4.7 (k-value list and methodology)
+
+### Block 4.9: KNN Validation Performance by k
+- Type: visualization
+- Purpose: Reader visualizes the bias-variance tradeoff — how k impacts validation error and identifies the optimal k.
+- Input: knn_k_list, knn_val_results (from Block 4.8)
+- Output: Displayed figure inline in notebook
+- Visualization Spec: Scatter plot with connecting line. x-axis = k (log scale, values 1,3,5,7,10,15,20,30,50). y-axis = validation MSE. Blue filled circles at each (k, MSE) point, connected by a thin gray line. Vertical dashed green line at x = knn_best_k. Title: "KNN Validation MSE vs. k". Annotation: "Best k = {knn_best_k}" near the green line. Grid on.
+- Dependencies: Block 4.8 (k values and MSE results)
+
+### Block 4.10: XGBoost Architecture Overview
+- Type: markdown_narrative
+- Purpose: Reader understands gradient boosting as sequential tree building, the histogram-based split finding algorithm, and why grid search + CV is the core "training loop" for XGBoost.
+- Input: None (conceptual)
+- Output: None (sets up XGBoost blocks)
+- Visualization Spec: None
+- Narrative Content: Explain XGBoost: ensemble of decision trees built sequentially, each tree corrects residuals of prior ensemble. Histogram-based algorithm bins continuous features for efficient split finding — runs on GPU via ROCm (device='cuda', tree_method='hist'). Key hyperparameters: max_depth (tree complexity), learning_rate (shrinkage per tree), subsample (row sampling per tree), colsample_bytree (column sampling per tree), min_child_weight (minimum sum of instance weight in a leaf — regularization). Objective: reg:squarederror for standard MSE regression. Describe the grid search strategy: 216 combinations across 5 hyperparameters, evaluated with 3-fold cross-validation on a 200K-row subsample to make search tractable. Early stopping of 20 rounds within each fold to avoid over-building trees. After best params found, retrain on full 1.8M+ rows. Subsample for search and full training both use GPU (ROCm).
+- Dependencies: Block 4.1 (data size context for subsampling rationale)
+
+### Block 4.11: XGBoost Grid Search and Cross-Validation
+- Type: code_output
+- Purpose: Reader sees the grid definition, the 216-combination Cartesian product, and the 3-fold CV loop with early stopping that finds the best hyperparameter set.
+- Input: X_train, ytr (from Block 4.1); param grid definitions
+- Output: xgb_param_grid (dict: max_depth=[5,7,9,11], learning_rate=[0.01,0.03,0.05], subsample=[0.7,0.8,0.9], colsample_bytree=[0.6,0.8], min_child_weight=[1,3,5]), xgb_search_results (dataframe: 216 rows, columns = params + mean_cv_score + std_cv_score), xgb_best_params (dict of best hyperparameter combination), xgb_best_cv_score (float, best mean validation MSE from 3-fold CV)
+- Visualization Spec: None
+- Dependencies: Block 4.1 (train data), Block 4.10 (hyperparameter semantics)
+
+### Block 4.12: XGBoost Full Training with Best Parameters
+- Type: code_output
+- Purpose: Reader sees the final model trained on the entire training set with the best hyperparameters — the deliverable trained XGBoost object.
+- Input: X_train, ytr (all 1.8M+ rows), X_val, yva, xgb_best_params (from Block 4.11)
+- Output: xgb_model (trained XGBRegressor object), xgb_train_losses (per-iteration training loss from evals_result), xgb_val_losses (per-iteration validation loss from evals_result), xgb_best_iteration (int, iteration where early stopping fired), xgb_actual_boost_rounds (total trees built)
+- Visualization Spec: None
+- Dependencies: Block 4.11 (best params), Block 4.1 (full data)
+
+### Block 4.13: XGBoost Training Curves
+- Type: visualization
+- Purpose: Reader visually inspects XGBoost training — convergence of boosting rounds, validation loss trajectory, and where early stopping triggered.
+- Input: xgb_train_losses, xgb_val_losses, xgb_best_iteration (from Block 4.12)
+- Output: Displayed figure inline in notebook
+- Visualization Spec: Dual line plot. x-axis = boosting round (1 to xgb_actual_boost_rounds). y-axis = RMSE or MSE loss. Blue solid line = training loss. Orange solid line = validation loss. Vertical dashed red line at x = xgb_best_iteration. Title: "XGBoost Training Curves". Legend upper right. Grid on. Annotation: "Best iteration: {xgb_best_iteration}".
+- Dependencies: Block 4.12 (loss arrays and best iteration)
+
+### Block 4.14: Model Training Summary
+- Type: markdown_narrative
+- Purpose: Reader synthesizes the three training approaches — their fundamentally different philosophies (gradient descent vs. lazy vs. boosting), computational requirements (GPU vs. GPU-distance vs. GPU-hist), and training dynamics.
+- Input: best_epoch (Block 4.5), knn_best_k and knn_val_results (Block 4.8), xgb_best_iteration and xgb_best_params (Block 4.11/4.12)
+- Output: None (narrative synthesis)
+- Visualization Spec: None
+- Narrative Content: Compare the three approaches: MLP learns a continuous nonlinear function via SGD — ~700K parameters, GPU, 150-epoch ceiling, early stopping after convergence. KNN stores data and queries at inference time — zero trainable parameters, GPU for distance math, k controls smoothness. XGBoost greedily adds trees — sequential, GPU histogram (ROCm), best hyperparams found via 216-combo grid search + 3-fold CV. Contrast training times, memory footprints, and the cost of hyperparameter search. Preview that next section (Section 5) will evaluate all three on the held-out test set using evals and preds_dict.
+- Dependencies: Block 4.5, Block 4.8, Block 4.9, Block 4.11, Block 4.12
 
 ---
 
-## Task 3.1: Create `src/feature_engineering.py` — Core Structure
+## Section 5: Evaluation
 
-**Create:** `src/feature_engineering.py` — all feature functions in one module.
+### Block 5.1: Section Header — "5. Evaluation"
+- Type: section_header
+- Purpose: Frame the evaluation as a multi-model, multi-angle assessment — metrics alone are insufficient; residuals, direction, clustering, and PCA reveal deeper model behavior.
+- Input: (none — structural marker)
+- Output: Rendered section heading in notebook
+- Dependencies: (none)
 
-```python
-"""Feature engineering pipeline for USD/CHF 1-min data.
+### Block 5.2: Compute Regression Metrics
+- Type: code_output
+- Purpose: Compute the five core regression metrics (RMSE, MAE, R², MAPE, Direction Accuracy) for all three models to populate the comparison table.
+- Input: yte (true test labels), preds_dict (dict of model_name → y_pred arrays for MLP, KNN, XGBoost)
+- Output: metrics_df — pandas DataFrame with index = model names, columns = ['RMSE', 'MAE', 'R²', 'MAPE (%)', 'Direction Accuracy (%)']
+- Dependencies: Block 5.1
 
-Builds: lag features, rolling statistics, technical indicators (RSI, MACD, BB),
-price-derived features (returns, spreads), time-based cyclical features,
-and the target variable (close at t+LOOKAHEAD).
-"""
-import numpy as np
-import pandas as pd
-from sklearn.preprocessing import StandardScaler
-from src.config import LAG_PERIODS, ROLLING_WINDOWS, ROLLING_STATS, TARGET_COL, LOOKAHEAD
+### Block 5.3: Regression Metrics Table
+- Type: table
+- Purpose: Display the numeric regression metrics in a formatted table so the reader can compare all three models at a glance.
+- Input: metrics_df (from Block 5.2)
+- Output: Rendered table in notebook (best value per column highlighted in bold)
+- Dependencies: Block 5.2
 
+### Block 5.4: Residual Distribution — Histogram + KDE
+- Type: visualization
+- Purpose: Reveal the shape, center, and spread of residual distributions per model — zero-centered and symmetric residuals indicate unbiased predictions.
+- Input: yte, preds_dict
+- Output: residual_dist.png — 1×3 subplot grid
+- Visualization Spec: 1 row × 3 columns. Each subplot: histogram of residuals (residual = y_true − y_pred) for one model, bins=50, with overlaid KDE curve. X-axis: residual value (shared scale across subplots). Y-axis: density. Color: consistent per-model color (MLP=#2ca02c green, KNN=#ff7f0e orange, XGBoost=#1f77b4 blue). Title per subplot: model name + skewness/kurtosis annotation. Vertical dashed line at x=0.
+- Dependencies: Block 5.2
 
-# ── 3a. Lag Features ──────────────────────────────────────────────────
+### Block 5.5: Residual QQ Plot — Normality Check
+- Type: visualization
+- Purpose: Assess whether residuals follow a Gaussian distribution — deviations from the diagonal reveal heavy tails or skew, which violate standard regression assumptions.
+- Input: yte, preds_dict
+- Output: qq_plot.png — 1×3 subplot grid
+- Visualization Spec: 1 row × 3 columns. Each subplot: scipy.stats.probplot QQ plot (theoretical quantiles vs sample quantiles) for one model's residuals. X-axis: theoretical normal quantiles. Y-axis: ordered residual values. Red diagonal reference line (y=x scaled to data). Model colors same as Block 5.4. Title: model name. If residuals are normal, points lie on the line.
+- Dependencies: Block 5.4
 
-def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Create lagged close price features.
+### Block 5.6: Residual ACF Plot — Time-Series Independence
+- Type: visualization
+- Purpose: Test whether residuals exhibit serial correlation — significant autocorrelation at any lag means the model fails to capture temporal structure, undermining i.i.d. assumptions.
+- Input: yte, preds_dict
+- Output: acf_plot.png — 1×3 subplot grid
+- Visualization Spec: 1 row × 3 columns. Each subplot: statsmodels ACF correlogram of residuals for one model, lags 0–40. Blue bars = autocorrelation values. Light blue shaded region = 95% confidence interval (±1.96/√n). X-axis: lag. Y-axis: autocorrelation (−1 to 1). Title: model name. Bars crossing the shaded band are statistically significant.
+- Dependencies: Block 5.4
 
-    Example: close_lag_1 = close at t-1, close_lag_5 = close at t-5
-    """
-    for lag in LAG_PERIODS:
-        df["close_lag_{lag}".format(lag=lag)] = df[TARGET_COL].shift(lag)
-    return df
+### Block 5.7: Actual vs Predicted Scatter
+- Type: visualization
+- Purpose: Visualize prediction quality — points clustering tightly along the diagonal indicate strong fit; systematic deviations (fanning, curvature, offset) expose model weaknesses.
+- Input: yte, preds_dict
+- Output: scatter_actual_vs_pred.png — single figure with 3 overlaid scatter series
+- Visualization Spec: Single axes. Three scatter series overlaid: XGBoost (blue, alpha=0.3), KNN (orange, alpha=0.3), MLP (green, alpha=0.3). X-axis: y_true (actual). Y-axis: y_pred (predicted). Black dashed diagonal y=x reference line (perfect prediction). Legend identifies each model. Annotations: R² value per model in matching color in corner or legend.
+- Dependencies: Block 5.2
 
+### Block 5.8: Direction Classification — Compute
+- Type: code_output
+- Purpose: Convert regression outputs to binary direction labels (up/down) and compute confusion matrices plus precision/recall/F1 metrics — this evaluates whether models correctly predict the sign of movement, independent of magnitude accuracy.
+- Input: yte, preds_dict
+- Output: dir_cm_dict — dict of model_name → 2×2 confusion matrix (rows=true, cols=pred; [0,0]=TN down-correct, [0,1]=FP down-wrong, [1,0]=FN up-wrong, [1,1]=TP up-correct). dir_metrics_df — DataFrame with index = model names, columns = ['Accuracy', 'Precision', 'Recall', 'F1-Score'].
+- Computation: For each model, compute y_true_dir = (yte > 0).astype(int), y_pred_dir = (y_pred > 0).astype(int). Then sklearn confusion_matrix and classification_report → extracted metrics.
+- Dependencies: Block 5.2
 
-# ── 3b. Rolling Window Features ───────────────────────────────────────
+### Block 5.9: Direction Classification — Confusion Matrix Heatmaps
+- Type: visualization
+- Purpose: Visualize per-model confusion matrices as annotated heatmaps so the reader can see where direction errors occur (false up-calls vs false down-calls).
+- Input: dir_cm_dict (from Block 5.8)
+- Output: dir_confusion_matrix.png — 1×3 subplot grid
+- Visualization Spec: 1 row × 3 columns. Each subplot: seaborn heatmap of 2×2 confusion matrix. Cells annotated with count + row-normalized percentage. Colormap: Blues (darker = higher count). X-axis labels: Predicted Down, Predicted Up. Y-axis labels: Actual Down, Actual Up. Title: model name. Consistent model colors in title text.
+- Dependencies: Block 5.8
 
-def add_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Create rolling statistics of close price.
+### Block 5.10: Direction Classification — Metrics Table
+- Type: table
+- Purpose: Display direction classification metrics (Accuracy, Precision, Recall, F1) for all three models side by side.
+- Input: dir_metrics_df (from Block 5.8)
+- Output: Rendered table in notebook (best value per column bolded)
+- Dependencies: Block 5.8
 
-    For each window in ROLLING_WINDOWS, compute each stat in ROLLING_STATS.
-    """
-    for window in ROLLING_WINDOWS:
-        roll = df[TARGET_COL].rolling(window=window)
-        for stat in ROLLING_STATS:
-            col_name = "close_roll_{stat}_{window}".format(stat=stat, window=window)
-            df[col_name] = getattr(roll, stat)()
-    return df
+### Block 5.11: Direction Classification — Narrative
+- Type: markdown_narrative
+- Purpose: Explain the critical distinction between regression accuracy and directional accuracy — a model can have low RMSE but poor direction guessing, or vice versa. Clarify that this binary classification is a derived view, not a separate model.
+- Input: dir_metrics_df (from Block 5.8)
+- Narrative Content:
+  - Define the conversion: y_true > 0 → class 1 (up), y_pred > 0 → class 1 (up). Emphasize: this is DIRECTION only, not return-magnitude classification.
+  - Explain each metric in this context: Accuracy = % of directions correctly called. Precision = when model says "up," how often is it right? Recall = of all actual up-moves, how many did model catch? F1 = harmonic mean, balances precision/recall.
+  - Note: baseline accuracy is ~50% for balanced up/down splits; models should exceed this.
+  - Compare direction accuracy to the Direction Accuracy (%) column from Block 5.3 (they should match — note this consistency check).
+  - Highlight if any model has high RMSE but strong direction accuracy (or vice versa) — tradeoff interpretation.
+- Dependencies: Block 5.8, Block 5.10
 
+### Block 5.12: Model Comparison — Grouped Bar Charts
+- Type: visualization
+- Purpose: Enable direct visual comparison of all five regression metrics and training time across the three models in a single figure.
+- Input: metrics_df (from Block 5.2), evals dict (for training_time per model)
+- Output: model_comparison.png — 2×3 subplot grid
+- Visualization Spec: Top row (5 subplots): grouped bar charts, one per metric (RMSE, MAE, R², MAPE, Direction Accuracy). Each subplot: 3 bars side by side (XGBoost blue, KNN orange, MLP green), x-axis = model name, y-axis = metric value. Metric name as subplot title. Bottom row, 1 subplot spanning full width: grouped bar chart for training time (seconds), same color scheme. Value annotations on top of each bar. Consistent y-axis lower bound at 0 for MAE/RMSE/MAPE/time; R² may go negative (set y_min = min(0, min_r2 - 0.1)).
+- Dependencies: Block 5.2, Block 5.3
 
-# ── 3c. Price-Derived Features ────────────────────────────────────────
+### Block 5.13: Silhouette Analysis — Compute + Plot
+- Type: visualization
+- Purpose: Determine the natural number of clusters in the feature space by evaluating KMeans silhouette scores for k=2..8 — higher silhouette = better-defined, more separable clusters.
+- Input: X_test (20K random subsample from test set), selected_features = ['log_return', 'hl_spread', 'rsi_14', 'macd_hist', 'bb_position_20', 'atr_14']
+- Output: silhouette_plot.png — single line plot. best_k (integer), silhouette_scores (list of floats per k)
+- Visualization Spec: Line plot with markers. X-axis: k (number of clusters, 2 through 8). Y-axis: silhouette score (range −1 to 1). Blue line with circular markers at each k. Annotate the best k with a star marker and text label ("Best k = X, score = Y.YYY"). Horizontal reference line at y=0 (worse than random). Y-axis lower bound = 0 or min(0, min_score − 0.05). Title: "Silhouette Score vs Number of Clusters". Compute: sklearn KMeans(n_clusters=k, random_state=42).fit_predict() + silhouette_score() per k.
+- Dependencies: Block 5.1
 
-def add_price_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Create derived price features: returns, spreads, ratios."""
-    # Log return (close vs prev close)
-    df["log_return"] = np.log(df[TARGET_COL] / df[TARGET_COL].shift(1))
+### Block 5.14: Silhouette Interpretation — Narrative
+- Type: markdown_narrative
+- Purpose: Explain what silhouette scores mean in this financial feature context and what the best k reveals about the data structure.
+- Input: best_k, silhouette_scores (from Block 5.13)
+- Narrative Content:
+  - Define silhouette: per-sample measure = (b − a) / max(a, b), where a = mean intra-cluster distance, b = mean nearest-cluster distance. Range [−1, 1]. High positive = sample well-matched to own cluster, far from others. Near 0 = boundary sample. Negative = likely misclassified.
+  - Cluster-average silhouette is the mean across all samples. Used for k selection.
+  - Interpret the observed curve: if scores are low overall (<0.3), the feature space lacks strong cluster structure — data is fairly continuous. If scores peak at small k and decline, natural clusters exist but are few. If scores increase with k, the data resists partitioning.
+  - Connect to domain: what does it mean for financial features like RSI, MACD, and log-returns to have (or lack) distinct clusters? Market regimes? Volatility states?
+  - State the chosen best k and its silhouette score, and what practical use KMeans labels serve downstream (e.g., coloring PCA plots in Block 5.15).
+- Dependencies: Block 5.13
 
-    # Simple return (fractional change)
-    df["pct_change"] = df[TARGET_COL].pct_change()
+### Block 5.15: PCA — 2-Component Projection
+- Type: visualization
+- Purpose: Project the high-dimensional test feature space into 2D to visually assess structure, cluster coherence, and error distribution patterns.
+- Input: X_test (30K random subsample), feature_cols (all feature columns), best_k + KMeans labels (from Block 5.13), preds_dict (for XGBoost errors), yte
+- Output: pca_views.png — 1×3 subplot grid
+- Visualization Spec: All subplots share the same 2D PCA projection (PC1 on x-axis, PC2 on y-axis). PCA computed via sklearn PCA(n_components=2) on standardized 30K samples. Variance explained annotated per axis label (e.g., "PC1 (34.2%)").
+  - Subplot 1 — Colored by KMeans Cluster: Scatter plot, each point colored by its KMeans cluster label (from Block 5.13 best_k). Discrete colormap (tab10). Title: "PCA Colored by KMeans Cluster (k={best_k})". Reveals whether clusters form coherent, separable groups in PCA space.
+  - Subplot 2 — Colored by |log_return|: Scatter plot, each point colored by absolute log-return magnitude (continuous colormap: viridis or RdYlGn). Colorbar labeled "|log_return|". Title: "PCA Colored by |log-return|". Reveals whether extreme returns cluster in specific PCA regions.
+  - Subplot 3 — Colored by XGBoost |error|: Scatter plot, each point colored by |yte − XGBoost_pred|. Continuous colormap: hot/inferno. Colorbar labeled "|XGBoost Error|". Title: "PCA Colored by XGBoost |Error|". Reveals whether prediction errors concentrate in specific regions of feature space (systematic failure zones).
+  - Point size: small (s=1 or s=2), alpha=0.4–0.6 for density readability with 30K points.
+- Dependencies: Block 5.13
 
-    # High-Low spread
-    df["hl_spread"] = df["high"] - df["low"]
-
-    # Open-Close range
-    df["oc_range"] = df[TARGET_COL] - df["open"]
-
-    # OHLC mean (central tendency)
-    df["ohlc_mean"] = (df["open"] + df["high"] + df["low"] + df[TARGET_COL]) / 4
-
-    return df
-
-
-# ── 3d. Technical Indicators ──────────────────────────────────────────
-
-def add_rsi(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
-    """Relative Strength Index (RSI) — momentum oscillator.
-
-    RSI = 100 - (100 / (1 + RS)), where RS = avg_gain / avg_loss
-    """
-    delta = df[TARGET_COL].diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = (-delta).where(delta < 0, 0.0)
-    avg_gain = gain.rolling(window=period, min_periods=period).mean()
-    avg_loss = loss.rolling(window=period, min_periods=period).mean()
-    rs = avg_gain / avg_loss
-    df["rsi_14"] = 100.0 - (100.0 / (1.0 + rs))
-    return df
-
-
-def add_bollinger_bands(df: pd.DataFrame, period: int = 20, num_std: float = 2.0) -> pd.DataFrame:
-    """Bollinger Bands: middle=MA, upper/lower = MA ± num_std * std."""
-    ma = df[TARGET_COL].rolling(window=period).mean()
-    std = df[TARGET_COL].rolling(window=period).std()
-    df["bb_mid_20"] = ma
-    df["bb_upper_20"] = ma + num_std * std
-    df["bb_lower_20"] = ma - num_std * std
-    df["bb_width_20"] = df["bb_upper_20"] - df["bb_lower_20"]
-    df["bb_position_20"] = (df[TARGET_COL] - df["bb_lower_20"]) / df["bb_width_20"]
-    return df
-
-
-def add_macd(df: pd.DataFrame) -> pd.DataFrame:
-    """MACD: MACD line = EMA12 - EMA26, Signal = EMA9(MACD), Hist = MACD - Signal."""
-    ema_12 = df[TARGET_COL].ewm(span=12, adjust=False).mean()
-    ema_26 = df[TARGET_COL].ewm(span=26, adjust=False).mean()
-    df["macd"] = ema_12 - ema_26
-    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
-    df["macd_hist"] = df["macd"] - df["macd_signal"]
-    return df
-
-
-# ── 3e. Time-Based Cyclical Features ──────────────────────────────────
-
-def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Extract cyclical time features from DatetimeIndex."""
-    df["hour"] = df.index.hour
-    df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
-    df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
-
-    df["dayofweek"] = df.index.dayofweek
-    df["dow_sin"] = np.sin(2 * np.pi * df["dayofweek"] / 7)
-    df["dow_cos"] = np.cos(2 * np.pi * df["dayofweek"] / 7)
-
-    return df
-
-
-# ── 3f. Master Pipeline ───────────────────────────────────────────────
-
-def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Complete feature engineering pipeline.
-
-    Builds ALL features, then drops NaN rows.
-
-    Returns:
-        DataFrame with all features + target column (close at t+LOOKAHEAD).
-    """
-    # 1. Target: future close price
-    df["target"] = df[TARGET_COL].shift(-LOOKAHEAD)
-
-    # 2. Feature groups (order matters — later groups may use earlier cols)
-    df = add_lag_features(df)
-    df = add_rolling_features(df)
-    df = add_price_features(df)
-    df = add_rsi(df)
-    df = add_bollinger_bands(df)
-    df = add_macd(df)
-    df = add_time_features(df)
-
-    # 3. Drop rows with NaN (first ~60 rows + last LOOKAHEAD row)
-    df.dropna(inplace=True)
-
-    return df
-
-
-def get_feature_columns(df: pd.DataFrame) -> list:
-    """Return list of feature column names (exclude target + raw OHLC)."""
-    exclude = {"open", "high", "low", TARGET_COL, "target",
-               "hour", "dayofweek"}  # raw time cols dropped (use sin/cos)
-    return [c for c in df.columns if c not in exclude]
-
-
-# ── 3g. Feature Scaling ───────────────────────────────────────────────
-
-def scale_features(
-    X_train: np.ndarray, X_val: np.ndarray, X_test: np.ndarray
-) -> tuple:
-    """Fit StandardScaler on train, transform all splits.
-
-    Returns:
-        X_train_scaled, X_val_scaled, X_test_scaled, scaler
-    """
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_val_scaled = scaler.transform(X_val)
-    X_test_scaled = scaler.transform(X_test)
-    return X_train_scaled, X_val_scaled, X_test_scaled, scaler
-```
-
-**Verify (each function individually):**
-
-```bash
-cd /home/bob/Documents/git/fp-ml && .venv/bin/python3 -c "
-from src.data_loader import load_data
-from src.feature_engineering import add_lag_features, add_rolling_features, add_price_features
-from src.feature_engineering import add_rsi, add_bollinger_bands, add_macd, add_time_features
-from src.feature_engineering import build_features, get_feature_columns
-
-df = load_data()
-df = build_features(df)
-feats = get_feature_columns(df)
-
-print('Rows after build:', len(df))
-print('Feature count:', len(feats))
-print('Nulls:', df.isnull().sum().sum())
-print('Target nulls:', df['target'].isnull().sum())
-print('Features:', feats[:5], '...', feats[-3:])
-print()
-print('Sample:\n', df[['close', 'target'] + feats[:3]].head())
-"
-```
-
-**Expected:**
-```
-Rows after build: ~522,700
-Feature count: 48-50
-Nulls: 0
-Target nulls: 0
-```
+### Block 5.16: Learning Curves — MLP Train/Val Loss
+- Type: visualization
+- Purpose: Diagnose MLP convergence and overfitting by plotting training and validation loss per epoch — diverging curves signal overfitting; flat validation loss signals saturation.
+- Input: MLP training history object (mlp_history or extracted from evals['MLP']['loss_curve']) — containing train_loss and val_loss arrays per epoch
+- Output: learning_curves.png — single dual-line plot
+- Visualization Spec: Dual line plot. X-axis: epoch (1 to N, where N = total training epochs). Y-axis: loss (MSE or log-scale depending on range). Blue solid line = training loss. Orange solid line = validation loss. Legend: "Training Loss", "Validation Loss". Vertical dashed red line at early stopping epoch (if applicable; annotate "Early Stop"). If validation loss minimum occurs at epoch M, annotate with marker and text: "Best Val Loss: X.XXXX (epoch M)". Title: "MLP Learning Curves — Training vs Validation Loss". Grid lines on. If overfitting is visible (val loss rising while train loss drops), add annotation: "Overfitting begins ~epoch K".
+- Dependencies: Block 5.1
 
 ---
 
-# PHASE 4: DATA SPLITTING
+## Section 6: Experimental Scenarios
+
+### Block 6.1: Scenario 1 — Parameter Tuning Introduction & Hypothesis
+- Type: markdown_narrative
+- Purpose: Frames the experiment: optimal hyperparameters improve generalization; KNN sensitive to k/weighting, XGBoost sensitive to learning rate/depth.
+- Input: None (section opening)
+- Output: None (displayed narrative)
+- Narrative Content: State hypothesis: "KNN performance will peak at moderate k (~10–50) with distance weighting outperforming uniform; XGBoost will show a sweet spot at moderate learning rate (~0.05–0.1) and depth (~5–7)." Define RMSE as evaluation metric. Explain why grid search on subsampled data is used (computational budget). Note: all models use feature_cols from prior preprocessing.
+- Dependencies: None (first block in section)
+
+### Block 6.2: KNN Hyperparameter Grid Search Sweep
+- Type: code_output
+- Purpose: Execute 2D grid search over k × weights on 100K train subsample, evaluate on X_val/yva, producing raw results for table and plot.
+- Input: X_train, ytr, X_val, yva, feature_cols
+- Output: knn_grid_df (DataFrame: columns k, weight, rmse_val); knn_best_k, knn_best_weight
+- Dependencies: Block 6.1
+
+### Block 6.3: KNN Parameter Tuning Results Table
+- Type: table
+- Purpose: Display all (k, weight) combinations with RMSE so reader can compare across the full grid.
+- Input: knn_grid_df
+- Output: Rendered table: columns = [k, Weight, RMSE]. Best row highlighted (bold or colored).
+- Visualization Spec: Not a chart — formatted table. 16 rows (8 k values × 2 weight schemes). Best row highlighted with background color.
+- Dependencies: Block 6.2
+
+### Block 6.4: KNN RMSE vs k Dual-Line Plot
+- Type: visualization
+- Purpose: Visualize performance curve — RMSE as function of k under both weighting schemes, highlighting optimal k.
+- Input: knn_grid_df
+- Output: Displayed figure (suggested filename: fig_knn_tuning.png)
+- Visualization Spec: Dual line plot. x-axis = k (logarithmic scale, values [1,3,5,10,20,50,100,200]). y-axis = RMSE. Blue solid line with circle markers = uniform weight. Orange dashed line with triangle markers = distance weight. Vertical dashed line (red) at best k. Annotation box: "Best: k=X, weight=Y, RMSE=Z". Legend top-right. Title: "KNN Hyperparameter Tuning — RMSE vs k"
+- Dependencies: Block 6.2
+
+### Block 6.5: XGBoost Hyperparameter Grid Search Sweep
+- Type: code_output
+- Purpose: Execute 2D grid search over learning_rate × max_depth on 200K train subsample with 200 trees, producing raw results for heatmap.
+- Input: X_train, ytr, X_val, yva, feature_cols
+- Output: xgb_grid_df (DataFrame: columns lr, max_depth, rmse_val); xgb_best_lr, xgb_best_depth, xgb_best_rmse
+- Dependencies: Block 6.1
+
+### Block 6.6: XGBoost Learning Rate vs Depth RMSE Heatmap
+- Type: visualization
+- Purpose: Show interaction surface of two hyperparameters — where combinations produce low RMSE.
+- Input: xgb_grid_df
+- Output: Displayed figure (suggested filename: fig_xgb_tuning_heatmap.png)
+- Visualization Spec: Heatmap. x-axis = learning_rate ([0.001, 0.01, 0.05, 0.1, 0.3]). y-axis = max_depth ([2, 3, 5, 7, 10]). Color = RMSE (coolwarm colormap: blue=low RMSE, red=high RMSE). Numeric RMSE value annotated in each cell. Best cell outlined with thick gold border. Colorbar labeled "RMSE". Title: "XGBoost Hyperparameter Tuning — RMSE Heatmap"
+- Dependencies: Block 6.5
+
+### Block 6.7: Scenario 2 — Feature Ablation Introduction & Hypothesis
+- Type: markdown_narrative
+- Purpose: Frames the experiment: measuring how many features each model needs to perform well; tests robustness to dimensionality reduction.
+- Input: None (new scenario)
+- Output: None (displayed narrative)
+- Narrative Content: State hypothesis: "MLP and XGBoost will retain performance with top 15 features but degrade with 5; KNN will degrade more sharply due to curse of dimensionality in reverse (too few features lose signal)." Define mutual information (MI) as feature importance metric: I(X_i; y) = Σ p(x,y) log[p(x,y)/(p(x)p(y))]. Explain procedure: compute MI on X_train/ytr, rank features, select top N, retrain each model on reduced feature set, evaluate on X_test/yte.
+- Dependencies: None (new scenario start)
+
+### Block 6.8: Mutual Information Feature Importance Computation
+- Type: code_output
+- Purpose: Compute MI scores for all 34 features, rank them, and select top-15 and top-5 feature subsets used by all three models.
+- Input: X_train, ytr, feature_cols
+- Output: mi_scores (Series, len=34, indexed by feature name, sorted descending); top15_features (list of 15 feature names); top5_features (list of 5 feature names)
+- Dependencies: Block 6.7
+
+### Block 6.9: Feature Ablation Results Table
+- Type: table
+- Purpose: Compare RMSE, MAE, R², and train time across all 3 models under 3 feature budgets.
+- Input: evals dict with keys: mlp_34, mlp_15, mlp_5, knn_34, knn_15, knn_5, xgb_34, xgb_15, xgb_5 — each containing rmse, mae, r2, train_time.
+- Output: Rendered table: columns = [Model, Feature Count, RMSE, MAE, R², Train Time (s)]. 9 rows. Sorted by Model then Feature Count descending. Best RMSE per model highlighted.
+- Visualization Spec: Formatted table. Model column merged/grouped (MLP rows together, KNN rows together, XGBoost rows together). Bold best RMSE value per model group.
+- Dependencies: Block 6.8
+
+### Block 6.10: RMSE vs Feature Count 3-Line Plot
+- Type: visualization
+- Purpose: Visual comparison of how each model's error grows as features are removed — reveals which model is most feature-dependent.
+- Input: Feature ablation results (extracted from evals into ablation_plot_df with columns: model, n_features, rmse)
+- Output: Displayed figure (suggested filename: fig_feature_ablation.png)
+- Visualization Spec: Line chart. x-axis = Feature Count ([5, 15, 34], linear scale). y-axis = RMSE. Three color-coded lines with markers: blue = MLP, orange = KNN, green = XGBoost. Marker at each point. Solid lines connecting. Legend upper-right. Title: "Feature Ablation — RMSE vs Number of Features"
+- Dependencies: Block 6.9
+
+### Block 6.11: Scenario 3 — Train Size Sensitivity Introduction & Hypothesis
+- Type: markdown_narrative
+- Purpose: Frames the experiment: how much training data is enough; quantifies diminishing returns of adding more samples.
+- Input: None (new scenario)
+- Output: None (displayed narrative)
+- Narrative Content: State hypothesis: "RMSE will drop steeply from 10% to 50% and plateau beyond 75%, indicating that ~75% of the training data captures most learnable signal." Define learning curve concept. Explain procedure: fixed seed random subsampling at 5 fractions, train XGBoost with best parameters from Scenario 1 (xgb_best_lr, xgb_best_depth), evaluate on full X_test/yte. Note why XGBoost is chosen (fastest to train, best performer in prior experiments).
+- Dependencies: Block 6.5 (needs xgb_best_lr, xgb_best_depth)
+
+### Block 6.12: Train Size Sensitivity Sweep
+- Type: code_output
+- Purpose: Train XGBoost on 5 progressively larger random subsamples of training data with fixed seed, evaluate on full test set.
+- Input: X_train, ytr, X_test, yte, feature_cols, xgb_best_lr, xgb_best_depth
+- Output: size_results_df (DataFrame: columns frac, n_train_samples, rmse_test, r2_test, train_time_s). 5 rows for [0.10, 0.25, 0.50, 0.75, 1.00].
+- Dependencies: Block 6.11, Block 6.5
+
+### Block 6.13: Train Size Sensitivity Results Table
+- Type: table
+- Purpose: Tabulate RMSE, R², and training time at each fraction so reader sees exact tradeoff.
+- Input: size_results_df
+- Output: Rendered table: columns = [Train %, Train Samples, RMSE, R², Train Time (s)]. Train % formatted as "10%", "25%", etc. Best RMSE row highlighted.
+- Visualization Spec: Formatted table. 5 data rows. Full 100% row bolded as reference baseline.
+- Dependencies: Block 6.12
+
+### Block 6.14: Learning Curve — RMSE vs Train Samples
+- Type: visualization
+- Purpose: Show classic learning curve shape — steep initial improvement, diminishing returns, plateau.
+- Input: size_results_df
+- Output: Displayed figure (suggested filename: fig_learning_curve.png)
+- Visualization Spec: Single line plot with markers. x-axis = Train Samples (logarithmic scale). y-axis = RMSE. Blue line with circle markers. Shaded 95% confidence band (if bootstrap replicates available; otherwise omit). Horizontal dashed gray line at final RMSE (100% train) labeled "asymptotic RMSE = X". Title: "XGBoost Learning Curve — RMSE vs Training Set Size". Annotation: "Diminishing returns beyond ~75%"
+- Dependencies: Block 6.12
+
+### Block 6.15: Cross-Scenario Summary Table
+- Type: table
+- Purpose: One-glance summary: key finding, best config, and RMSE from each scenario for reader synthesis.
+- Input: knn_best_k, knn_best_weight (Block 6.2), knn_grid_df (Block 6.2), xgb_best_lr, xgb_best_depth, xgb_grid_df (Block 6.5), ablation_plot_df (Block 6.10), size_results_df (Block 6.12)
+- Output: Rendered table: columns = [Scenario, Key Finding, Best Config, Best RMSE]. 3 rows:
+  - Row 1: "1. Parameter Tuning" | "Distance weighting and moderate k/depth critical" | "KNN: k=best_k, weight=best_weight; XGB: lr=best_lr, depth=best_depth" | best RMSE from each
+  - Row 2: "2. Feature Ablation" | "15 features sufficient; <5 features collapse performance" | "Top 15 features, XGBoost" | best RMSE from ablation
+  - Row 3: "3. Train Size Sensitivity" | "~75% data captures nearly all signal" | "75% subsample" | RMSE at 75%
+- Visualization Spec: Formatted summary table. Bold key numbers. Scenario column as row headers.
+- Dependencies: Block 6.2, Block 6.5, Block 6.9, Block 6.12
 
 ---
 
-## Task 4.1: Create `src/data_splitting.py`
+## Section 7: Conclusion
 
-**Create:** `src/data_splitting.py`
+### Block 7.1: Conclusion Section Header
+- Type: section_header
+- Purpose: Delimit the start of the conclusion and signal synthesis mode to the reader.
+- Input: None
+- Output: Rendered heading "7. Conclusion"
+- Dependencies: None
 
-```python
-"""Chronological train/validation/test split for time-series data."""
-import numpy as np
-from src.config import TRAIN_CUTOFF, VAL_CUTOFF
+### Block 7.2: Key Findings — Model Performance Summary
+- Type: markdown_narrative
+- Purpose: Reader learns which model won (XGBoost) and why — it was the only model to achieve positive R² (+0.006) on the test set, extracting a tiny but real signal from noisy 1-min forex data.
+- Input: evals (dict with keys mlp, knn, xgb, each containing rmse, r2, mape, dir_acc)
+- Output: Narrative text covering: (a) XGBoost achieves RMSE=0.000130, R²=+0.006, DirAcc=46.6% — best on all metrics; (b) KNN close second (RMSE=0.000132, R²=-0.015, DirAcc=46.2%); (c) MLP struggles (RMSE=0.000151, R²=-0.331, DirAcc=45.8%) despite largest capacity — deep networks overfit noise when signal is extremely weak; (d) all MAPE < 0.01% means price predictions are highly precise even if direction is near-random.
+- Dependencies: evals dict (produced in Section 5)
 
+### Block 7.3: Final Comparison Table
+- Type: table
+- Purpose: Reader sees all models side-by-side across all metrics for at-a-glance comparison.
+- Input: evals (per-model metrics), model training times from training cells
+- Output: Markdown table with columns: Model | RMSE ↓ | MAE | R² ↑ | MAPE% ↓ | DirAcc% ↑ | Train Time. Rows: MLP (GPU), KNN (GPU), XGBoost (ROCm GPU). Best value in each column bolded.
+- Dependencies: evals (Section 5), training times from Section 4
 
-def split_data(df):
-    """Split into train/val/test preserving temporal order.
+### Block 7.4: Direction Accuracy Ceiling — Why ~47% Is Expected
+- Type: markdown_narrative
+- Purpose: Reader understands that ~46-47% directional accuracy does not mean the model is useless — it reflects the efficient-market / random-walk nature of 1-min forex where the theoretical ceiling for directional prediction on a single instrument without external information is just above 50%.
+- Input: evals.*.dir_acc, confusion matrix metrics from Section 5 (cm_mlp, cm_knn, cm_xgb with precision/recall/F1)
+- Output: Narrative explaining: (a) efficient market hypothesis implies near-50% directional accuracy ceiling for any model using only price history; (b) 46.6% vs 50% baseline means the model captures a real but tiny edge; (c) regression metrics (RMSE/R²) are the appropriate evaluation framework, not classification; (d) precision/recall breakdown shows up-moves are slightly more predictable than down-moves (if true from confusion matrix data).
+- Dependencies: evals (Section 5), confusion matrix results (Section 5)
 
-    Returns:
-        X_train, X_val, X_test, y_train, y_val, y_test, feature_names
-    """
-    from src.feature_engineering import get_feature_columns
+### Block 7.5: XGBoost Feature Importance — Code Output
+- Type: code_output
+- Purpose: Extract which of the 34 engineered features most influence XGBoost predictions, computed from the trained model's gain-based importance scores.
+- Input: model_xgb (trained XGBoost booster from Section 4), feature_cols (list of 34 feature names from Section 3)
+- Output: feature_importance (DataFrame with columns: feature, importance_gain, importance_pct; sorted descending by gain; top 15 rows)
+- Dependencies: model_xgb (Section 4), feature_cols (Section 3)
 
-    feature_cols = get_feature_columns(df)
+### Block 7.6: XGBoost Feature Importance — Visualization
+- Type: visualization
+- Purpose: Reader sees which engineered features dominate XGBoost decisions and understands that price-derived features (log_return, hl_spread) and recent lags matter more than technical indicators.
+- Input: feature_importance (from Block 7.5)
+- Output: Horizontal bar chart. x-axis: importance score (gain). y-axis: feature name. Top 15 features only. Color: single blue gradient (darker = higher importance). Title: "XGBoost Feature Importance — Top 15 Features". Annotation: total explained gain % in top-right corner.
+- Visualization Spec: Horizontal bar chart, x=importance_gain, y=feature (top 15 descending), color=#2563eb gradient, title="XGBoost Feature Importance — Top 15 Features", annotation at top-right showing cumulative importance percentage.
+- Dependencies: Block 7.5
 
-    # Chronological split by date
-    train_mask = df.index < TRAIN_CUTOFF
-    val_mask = (df.index >= TRAIN_CUTOFF) & (df.index < VAL_CUTOFF)
-    test_mask = df.index >= VAL_CUTOFF
+### Block 7.7: Effect of Training Set Size — Code Output
+- Type: code_output
+- Purpose: Quantify how XGBoost performance scales with training data volume by retraining at 1%, 5%, 10%, 25%, 50%, 100% fractions of the full train set and evaluating on the validation set.
+- Input: X_train, ytr, X_val, yva, best XGBoost params from Section 4 (best_params_xgb: max_depth=5, lr=0.05, subsample=0.9, colsample_bytree=0.6, min_child_weight=5, n_estimators=65)
+- Output: train_size_results (dict: fraction → {rmse, r2, dir_acc, train_time_sec})
+- Dependencies: X_train, ytr, X_val, yva (Section 3), best_params_xgb (Section 4)
 
-    X_train = df.loc[train_mask, feature_cols].values
-    y_train = df.loc[train_mask, "target"].values
-    X_val = df.loc[val_mask, feature_cols].values
-    y_val = df.loc[val_mask, "target"].values
-    X_test = df.loc[test_mask, feature_cols].values
-    y_test = df.loc[test_mask, "target"].values
+### Block 7.8: Effect of Training Set Size — Visualization
+- Type: visualization
+- Purpose: Reader sees that XGBoost benefits substantially from more data up to ~50% of the training set, then shows diminishing returns — confirming that 1.8M samples is sufficient.
+- Input: train_size_results (from Block 7.7)
+- Output: Dual-axis line plot. x-axis: training set fraction (1%, 5%, 10%, 25%, 50%, 100% on log scale). Left y-axis: RMSE (blue line, circles). Right y-axis: Direction Accuracy % (orange line, triangles). Title: "Scaling Behavior: XGBoost Performance vs Training Set Size". Horizontal dashed line at RMSE=0.000130 (full-size baseline). Annotation: "Diminishing returns beyond ~50%" with arrow at 50% point.
+- Visualization Spec: Dual-axis line plot, x=fraction (log scale, labels: 1%, 5%, 10%, 25%, 50%, 100%), y1=RMSE (blue #2563eb line with circle markers), y2=Direction Accuracy % (orange #f59e0b line with triangle markers), horizontal dashed line at y1=0.000130 labeled "Full train set baseline", annotation arrow at x=50% with text "Diminishing returns", title="Scaling Behavior: XGBoost Performance vs Training Set Size"
+- Dependencies: Block 7.7
 
-    print("Train: {n:,} rows ({pct:.0f}%)".format(
-        n=len(X_train), pct=train_mask.sum() / len(df) * 100))
-    print("Val:   {n:,} rows ({pct:.0f}%)".format(
-        n=len(X_val), pct=val_mask.sum() / len(df) * 100))
-    print("Test:  {n:,} rows ({pct:.0f}%)".format(
-        n=len(X_test), pct=test_mask.sum() / len(df) * 100))
+### Block 7.9: Model Recommendation for Deployment
+- Type: markdown_narrative
+- Purpose: Reader learns that XGBoost is the recommended model for deployment, with explicit trade-off analysis: it has the best accuracy but longest training time (14.8m grid search; 5s inference), while MLP offers fastest inference (GPU batch) at the cost of negative R², and KNN offers middle ground but requires storing the full 100K-sample reference set.
+- Input: evals (all metrics), model file sizes (mlp_v2.pt = 2.8MB, xgboost_v2.json = 281KB, KNN reference set size), training/inference times
+- Output: Narrative covering: (a) XGBoost recommended — best R², best DirAcc, smallest model file (281KB), fast inference (5s on 276K test samples); (b) MLP trade-off — fast GPU inference but unreliable predictions (R² negative, meaning it's worse than predicting the mean); (c) KNN trade-off — competitive accuracy but requires storing 100K reference samples in memory, inference time scales with test set size; (d) for production, retrain XGBoost weekly on latest data with same hyperparams.
+- Dependencies: evals (Section 5), model file metadata
 
-    return X_train, X_val, X_test, y_train, y_val, y_test, feature_cols
+### Block 7.10: Study Limitations
+- Type: markdown_narrative
+- Purpose: Reader understands the boundary conditions of this study so they don't overgeneralize: 1-min data is inherently noisy (bid-ask bounce, microstructure noise), no macro-economic features (interest rates, news sentiment, correlated pairs), single currency pair (USD/CHF may not generalize to other pairs), and no transaction cost modeling (spread, slippage, commission would erode the tiny edge).
+- Input: None (describes study design constraints)
+- Output: Narrative listing each limitation with its practical implication: (a) 1-min noise → signal-to-noise ratio is extremely low, limiting ceiling; (b) no external features → model only sees price history, missing macro drivers; (c) single pair → results may not transfer to other currency pairs with different volatility regimes; (d) no transaction costs → profitable deployment would require spread < 0.013% (RMSE scale) which is unrealistic for retail; (e) chronological split ensures temporal validity but single split means metrics have variance.
+- Dependencies: None (but positioned after deployment block for logical flow)
 
+### Block 7.11: Future Work
+- Type: markdown_narrative
+- Purpose: Reader learns the most promising next research directions: ensemble methods to combine model strengths, attention-based architectures (LSTM/Transformer) for temporal patterns, multi-currency modeling for cross-pair signal, longer forecast horizons (5min, 15min, 1hr), Optuna hyperparameter optimization, and time-series cross-validation.
+- Input: Future improvement ideas from project plan
+- Output: Narrative listing 6 future directions, each with a 1-sentence rationale: (a) Ensemble (stack XGBoost + KNN) — may push DirAcc past 47% by combining tree and distance-based signals; (b) LSTM/Transformer — sequence models can capture multi-step temporal dependencies that feedforward architectures miss; (c) Multi-currency — correlated pairs (EUR/USD, USD/JPY) provide additional predictive signal; (d) Longer horizons — 5-min/15-min/1-hour predictions may have higher signal-to-noise ratio than 1-min; (e) Optuna hyperparameter optimization — smarter search than manual grid may find better XGBoost/MLP configs; (f) TimeSeriesSplit cross-validation — expanding-window CV would quantify metric variance across time periods and detect regime-dependent performance.
+- Dependencies: None
 
-if __name__ == "__main__":
-    from src.data_loader import load_data
-    from src.feature_engineering import build_features
-
-    df = load_data()
-    df = build_features(df)
-    X_tr, X_v, X_te, y_tr, y_v, y_te, feats = split_data(df)
-    print("Feature count:", len(feats))
-    print("y_train range: {min:.5f} – {max:.5f}".format(min=y_tr.min(), max=y_tr.max()))
-    print("y_test  range: {min:.5f} – {max:.5f}".format(min=y_te.min(), max=y_te.max()))
-```
-
-**Verify:**
-```bash
-cd /home/bob/Documents/git/fp-ml && .venv/bin/python3 -m src.data_splitting
-```
-
-**Expected:**
-```
-Train: ~410,000 rows (78%)
-Val:   ~56,000 rows (11%)
-Test:  ~56,000 rows (11%)
-y_train range: 0.76xxx – 0.91xxx
-```
-
----
-
-# PHASE 5: KNN REGRESSOR
-
----
-
-## Task 5.1: Create `src/train_knn.py`
-
-**Create:** `src/train_knn.py`
-
-```python
-"""K-Nearest Neighbors Regressor for USD/CHF close price forecasting."""
-import pickle
-import time
-import numpy as np
-from sklearn.neighbors import KNeighborsRegressor
-from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
-from src.config import KNN_PARAM_GRID, RANDOM_SEED, MODEL_DIR, CV_FOLDS
-
-
-def train_knn(X_train_scaled: np.ndarray, y_train: np.ndarray) -> KNeighborsRegressor:
-    """Train KNN Regressor with GridSearchCV.
-
-    Args:
-        X_train_scaled: Scaled feature matrix. SCALING REQUIRED.
-        y_train: Target values (close price at t+1).
-
-    Returns:
-        Best KNeighborsRegressor from grid search.
-    """
-    print("=" * 60)
-    print("KNN REGRESSOR — GridSearchCV")
-    print("=" * 60)
-
-    base_model = KNeighborsRegressor(n_jobs=-1)
-    tscv = TimeSeriesSplit(n_splits=CV_FOLDS)
-
-    grid = GridSearchCV(
-        base_model,
-        KNN_PARAM_GRID,
-        cv=tscv,
-        scoring="neg_root_mean_squared_error",
-        n_jobs=-1,
-        verbose=2,
-    )
-
-    t0 = time.time()
-    grid.fit(X_train_scaled, y_train)
-    elapsed = time.time() - t0
-
-    print("\nTraining complete in {elapsed:.1f}s".format(elapsed=elapsed))
-    print("Best params:", grid.best_params_)
-    print("Best RMSE (CV): {score:.6f}".format(score=-grid.best_score_))
-
-    # Save model
-    model_path = MODEL_DIR + "/knn_regressor.pkl"
-    with open(model_path, "wb") as f:
-        pickle.dump(grid.best_estimator_, f)
-    print("Saved:", model_path)
-
-    return grid.best_estimator_
-
-
-if __name__ == "__main__":
-    from src.data_loader import load_data
-    from src.feature_engineering import build_features, scale_features
-    from src.data_splitting import split_data
-
-    df = load_data()
-    df = build_features(df)
-    X_tr, X_v, X_te, y_tr, y_v, y_te, feats = split_data(df)
-    X_tr_s, X_v_s, X_te_s, _ = scale_features(X_tr, X_v, X_te)
-
-    model = train_knn(X_tr_s, y_tr)
-```
-
-**Verify:**
-```bash
-cd /home/bob/Documents/git/fp-ml && .venv/bin/python3 -m src.train_knn
-```
-
-**Expected:** Grid search runs (2-5 min on 410K rows), prints best n_neighbors, weights, p. Saves `outputs/models/knn_regressor.pkl`.
+### Block 7.12: Final Takeaways
+- Type: markdown_narrative
+- Purpose: Reader leaves with 3 concise, memorable takeaways that synthesize the entire study into actionable conclusions.
+- Input: All previous blocks (synthesizes evals, feature_importance, train_size_results, limitation analysis)
+- Output: Three bullet-point takeaways: (1) "XGBoost with 34 engineered features achieves the only positive R² (+0.006) on 1-min USD/CHF — tree-based methods handle noisy, non-linear forex data better than neural networks or k-NN." (2) "Directional accuracy ceiling of ~46-47% is inherent to the problem — 1-min forex is near-random-walk, and the model's edge comes from magnitude prediction (RMSE 0.000130) rather than directional bets." (3) "Log-return transformation and chronological splitting are non-negotiable for multi-year time series — they prevent regime-shift failure (v1 R² was -3.26)."
+- Dependencies: Blocks 7.2–7.11
 
 ---
 
-# PHASE 6: SVR (Support Vector Regression)
+## Cell Count Estimate
+
+| Section | Title | Blocks | Markdown | Code/Output | Table | Visualization | Total Cells |
+|---------|-------|--------|----------|-------------|-------|---------------|-------------|
+| 1 | Project Description | 11 | 10 | 0 | 0 | 0 | 11 |
+| 2 | Exploratory Data Analysis | 13 | 4 | 1 | 3 | 4 | 13 |
+| 3 | Preprocessing & Feature Engineering | 15 | 2 | 10 | 1 | 1 | 15 |
+| 4 | Model Training | 14 | 5 | 5 | 0 | 3 | 14 |
+| 5 | Evaluation | 16 | 3 | 3 | 3 | 7 | 16 |
+| 6 | Experimental Scenarios | 15 | 3 | 4 | 4 | 4 | 15 |
+| 7 | Conclusion | 12 | 5 | 2 | 1 | 2 | 12 |
+| **Total** | | **96** | **32** | **25** | **12** | **21** | **~70** |
+
+Note: Some blocks combine into single notebook cells (e.g., a computation block and its immediate narrative may share one cell). The total of ~70 cells reflects this merging, with approximately 55–75 actual cells depending on how code+output and table+visualization pairs are combined.
 
 ---
 
-## Task 6.1: Create `src/train_svr.py`
+## Implementation Notes
 
-**Create:** `src/train_svr.py`
+Memory management: The raw CSV is ~119MB (2.3M rows). After preprocessing, the data.pt file is 301MB. Use float32 (not float64) for tensors to cut memory in half. Use .copy() sparingly; prefer in-place operations or views where safe. For PCA on 30K subsamples, the full test set is not needed in memory simultaneously.
 
-```python
-"""Support Vector Regression (SVR) for USD/CHF close price forecasting.
+GPU/CPU fallback: Check torch.cuda.is_available() before sending tensors to GPU. AMD ROCm 7.2 on RX 9060 XT is the primary GPU. If CUDA/ROCm unavailable, all operations fall back to CPU — MLP training will be slower (expect ~5x longer), KNN cdist will use torch on CPU (still functional but slower), XGBoost will also fall back to CPU (set device='cpu' accordingly). Set device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') at notebook startup.
 
-IMPORTANT: SVR has O(n²)~O(n³) complexity — we MUST subsample to ~50K rows.
-"""
-import pickle
-import time
-import numpy as np
-from sklearn.svm import SVR
-from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
-from src.config import SVR_PARAM_GRID, SVR_SAMPLE_SIZE, RANDOM_SEED, MODEL_DIR, CV_FOLDS
+ROCm compatibility: PyTorch ROCm build required (not standard CUDA PyTorch). Verify with torch.cuda.is_available() and torch.cuda.get_device_name(0). If "ROCm" or "AMD" appears in device name, GPU is correctly configured. Mixed precision (AMP) works on ROCm via torch.cuda.amp.GradScaler and autocast. No NVIDIA-specific extensions used.
 
+Chronological split: This is the single most critical design decision. Shuffling time series data causes look-ahead bias — the model learns future patterns that would not be available in real deployment. All preprocessing steps that involve fitting parameters (StandardScaler, PCA) must fit on training set only to prevent information leakage from validation/test into training.
 
-def subsample(X: np.ndarray, y: np.ndarray, n: int = SVR_SAMPLE_SIZE,
-              random_seed: int = RANDOM_SEED) -> tuple:
-    """Randomly subsample to n rows, preserving price distribution via quantile bins."""
-    n = min(n, len(y))
-    if n >= len(y):
-        return X, y
+Confusion matrix warning: The confusion matrix in Section 5.8–5.9 evaluates DIRECTION ONLY (sign of prediction vs sign of actual). This is NOT a classification model — it is a derived binary view of regression outputs. Precision/Recall/F1 for "Down" and "Up" classes should not be interpreted as standalone classifier performance. The baseline is ~50% (random coin flip on balanced data). Any score near 50% does not mean the model is broken — 1-min forex direction is inherently near-random.
 
-    # Bin prices into deciles
-    bins = np.quantile(y, np.linspace(0, 1, 11))
-    bin_indices = np.digitize(y, bins)
+Data pair consistency across sections: All notebooks cells must use USD/CHF as the currency pair. File path: data/processed/USDCHF_1min_2020_2026.csv. Prior template blocks may have referenced other pairs (EURUSD) — those references must be updated to USD/CHF in the implementation.
 
-    rng = np.random.RandomState(random_seed)
-    sample_idx = []
-    rows_per_bin = n // 10
+XGBoost GPU (ROCm): XGBoost 3.1.1 from ROCm/xgboost fork. Use tree_method='hist', device='cuda'. Note: device='hip' is NOT a valid param — always use device='cuda' which maps to HIP at compile time. GPU training verified with EllpackDMatrix on device. Grid search and full training both run on GPU.
 
-    for bin_id in range(1, 12):
-        idx = np.where(bin_indices == bin_id)[0]
-        if len(idx) == 0:
-            continue
-        take = min(rows_per_bin, len(idx))
-        sample_idx.extend(rng.choice(idx, size=take, replace=False))
+MLP weight initialization: Use default PyTorch initialization for Linear layers (Kaiming uniform). Do not manually set seeds per layer — the global seed=42 at notebook top is sufficient and keeps the implementation clean.
 
-    # Pad to exact n if needed
-    if len(sample_idx) < n:
-        remaining = np.setdiff1d(np.arange(len(y)), sample_idx)
-        sample_idx.extend(rng.choice(remaining, size=n - len(sample_idx), replace=False))
-
-    sample_idx = np.array(sample_idx)
-    print("Subsampled: {orig:,} → {new:,} rows (stratified by target quantiles)".format(
-        orig=len(X), new=n))
-    return X[sample_idx], y[sample_idx]
-
-
-def train_svr(X_train_scaled: np.ndarray, y_train: np.ndarray) -> SVR:
-    """Train SVR with GridSearchCV on subsampled data."""
-    print("=" * 60)
-    print("SVR — GridSearchCV (with subsampling)")
-    print("=" * 60)
-
-    # Subsample — O(n²) scaling makes full dataset impractical
-    X_sub, y_sub = subsample(X_train_scaled, y_train)
-
-    base_model = SVR(kernel="rbf")
-    tscv = TimeSeriesSplit(n_splits=CV_FOLDS)
-
-    grid = GridSearchCV(
-        base_model,
-        SVR_PARAM_GRID,
-        cv=tscv,
-        scoring="neg_root_mean_squared_error",
-        n_jobs=-1,
-        verbose=2,
-    )
-
-    t0 = time.time()
-    grid.fit(X_sub, y_sub)
-    elapsed = time.time() - t0
-
-    print("\nTraining complete in {elapsed:.1f}s".format(elapsed=elapsed))
-    print("Best params:", grid.best_params_)
-    print("Best RMSE (CV): {score:.6f}".format(score=-grid.best_score_))
-
-    # Save model
-    model_path = MODEL_DIR + "/svr_regressor.pkl"
-    with open(model_path, "wb") as f:
-        pickle.dump(grid.best_estimator_, f)
-    print("Saved:", model_path)
-
-    return grid.best_estimator_
-
-
-if __name__ == "__main__":
-    from src.data_loader import load_data
-    from src.feature_engineering import build_features, scale_features
-    from src.data_splitting import split_data
-
-    df = load_data()
-    df = build_features(df)
-    X_tr, X_v, X_te, y_tr, y_v, y_te, feats = split_data(df)
-    X_tr_s, X_v_s, X_te_s, _ = scale_features(X_tr, X_v, X_te)
-
-    model = train_svr(X_tr_s, y_tr)
-```
-
-**Verify:**
-```bash
-cd /home/bob/Documents/git/fp-ml && .venv/bin/python3 -m src.train_svr
-```
-
-**Expected:** Subsampled to 50K, grid search runs (5-15 min), prints best C, gamma, epsilon. Saves `outputs/models/svr_regressor.pkl`.
-
----
-
-# PHASE 7: XGBOOST REGRESSOR
-
----
-
-## Task 7.1: Create `src/train_xgboost.py`
-
-**Create:** `src/train_xgboost.py`
-
-```python
-"""XGBoost Regressor for USD/CHF close price forecasting."""
-import time
-import numpy as np
-import xgboost as xgb
-from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
-from src.config import XGB_PARAM_GRID, RANDOM_SEED, MODEL_DIR, CV_FOLDS
-
-
-def train_xgboost(
-    X_train: np.ndarray, y_train: np.ndarray,
-    X_val: np.ndarray = None, y_val: np.ndarray = None,
-) -> xgb.XGBRegressor:
-    """Train XGBoost Regressor with GridSearchCV + optional early stopping.
-
-    Args:
-        X_train: Feature matrix (scaling optional — tree-based models
-                 are scale-invariant, but we pass scaled for consistency).
-        y_train: Target values.
-        X_val, y_val: Optional validation set for early stopping.
-
-    Returns:
-        Best XGBRegressor from grid search.
-    """
-    print("=" * 60)
-    print("XGBOOST REGRESSOR — GridSearchCV")
-    print("=" * 60)
-
-    base_model = xgb.XGBRegressor(
-        objective="reg:squarederror",
-        random_state=RANDOM_SEED,
-        n_jobs=-1,
-        verbosity=0,
-    )
-    tscv = TimeSeriesSplit(n_splits=CV_FOLDS)
-
-    grid = GridSearchCV(
-        base_model,
-        XGB_PARAM_GRID,
-        cv=tscv,
-        scoring="neg_root_mean_squared_error",
-        n_jobs=-1,
-        verbose=2,
-    )
-
-    t0 = time.time()
-    grid.fit(X_train, y_train)
-    elapsed = time.time() - t0
-
-    print("\nTraining complete in {elapsed:.1f}s".format(elapsed=elapsed))
-    print("Best params:", grid.best_params_)
-    print("Best RMSE (CV): {score:.6f}".format(score=-grid.best_score_))
-
-    # Optional: retrain best model with early stopping on val set
-    if X_val is not None and y_val is not None:
-        print("\nRetraining with early stopping on validation set...")
-        best_params = dict(grid.best_params_)
-        best_params.pop("early_stopping_rounds", None)
-        model = xgb.XGBRegressor(
-            objective="reg:squarederror",
-            random_state=RANDOM_SEED,
-            n_jobs=-1,
-            verbosity=1,
-            **best_params,
-        )
-        model.fit(
-            X_train, y_train,
-            eval_set=[(X_val, y_val)],
-            verbose=False,
-        )
-    else:
-        model = grid.best_estimator_
-
-    # Save model
-    model_path = MODEL_DIR + "/xgboost_regressor.json"
-    model.save_model(model_path)
-    print("Saved:", model_path)
-
-    # Feature importance
-    importance = model.feature_importances_
-    top_indices = np.argsort(importance)[-10:][::-1]
-    print("\nTop 10 feature importances:")
-    for i in top_indices:
-        print("  feat_{idx}: {val:.4f}".format(idx=i, val=importance[i]))
-
-    return model
-
-
-if __name__ == "__main__":
-    from src.data_loader import load_data
-    from src.feature_engineering import build_features, scale_features
-    from src.data_splitting import split_data
-
-    df = load_data()
-    df = build_features(df)
-    X_tr, X_v, X_te, y_tr, y_v, y_te, feats = split_data(df)
-    X_tr_s, X_v_s, X_te_s, _ = scale_features(X_tr, X_v, X_te)
-
-    model = train_xgboost(X_tr_s, y_tr, X_v_s, y_v)
-```
-
-**Verify:**
-```bash
-cd /home/bob/Documents/git/fp-ml && .venv/bin/python3 -m src.train_xgboost
-```
-
-**Expected:** Grid search runs (10-30 min depending on combinations), prints best params, top 10 feature importances. Saves `outputs/models/xgboost_regressor.json`.
-
----
-
-# PHASE 8: EVALUATION MODULE
-
----
-
-## Task 8.1: Create `src/evaluate.py`
-
-**Create:** `src/evaluate.py`
-
-```python
-"""Evaluation metrics and plotting for regression models."""
-import numpy as np
-import matplotlib
-matplotlib.use("Agg")  # headless backend for SSH
-import matplotlib.pyplot as plt
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from src.config import PLOT_DIR, METRIC_DIR
-
-
-def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, model_name: str = "model") -> dict:
-    """Compute standard regression metrics.
-
-    Returns:
-        dict with: rmse, mae, mape, r2, directional_accuracy_pct, n_samples
-    """
-    # Filter out NaN predictions
-    mask = ~np.isnan(y_pred)
-    y_true = y_true[mask]
-    y_pred = y_pred[mask]
-
-    mae = mean_absolute_error(y_true, y_pred)
-    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-    r2 = r2_score(y_true, y_pred)
-
-    # MAPE — avoid division by zero
-    nonzero_mask = y_true != 0
-    mape = np.mean(np.abs(
-        (y_true[nonzero_mask] - y_pred[nonzero_mask]) / y_true[nonzero_mask]
-    )) * 100
-
-    # Directional accuracy (% of times model correctly predicts up/down)
-    actual_dir = np.sign(np.diff(y_true))
-    pred_dir = np.sign(np.diff(y_pred))
-    dir_acc = np.mean(actual_dir == pred_dir) * 100
-
-    metrics = {
-        "model": model_name,
-        "rmse": round(rmse, 8),
-        "mae": round(mae, 8),
-        "mape_pct": round(mape, 4),
-        "r2": round(r2, 6),
-        "directional_accuracy_pct": round(dir_acc, 2),
-        "n_samples": len(y_true),
-    }
-
-    print("\n" + "=" * 50)
-    print("  {name} — Evaluation".format(name=model_name))
-    print("=" * 50)
-    for k, v in metrics.items():
-        print("  {key}: {val}".format(key=k, val=v))
-    return metrics
-
-
-def plot_predictions(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    model_name: str = "model",
-    n_points: int = 500,
-) -> str:
-    """Plot actual vs predicted prices (time-series overlay + residuals).
-
-    Returns:
-        Path to saved PNG.
-    """
-    # Plot last n_points
-    y_true = y_true[-n_points:]
-    y_pred = y_pred[-n_points:]
-
-    fig, axes = plt.subplots(2, 1, figsize=(14, 8))
-    fig.suptitle(
-        "{name} — Actual vs Predicted (Last {n} Points)".format(name=model_name, n=n_points),
-        fontsize=14,
-    )
-
-    # Top: Overlay plot
-    ax = axes[0]
-    ax.plot(y_true, label="Actual", color="blue", linewidth=0.8, alpha=0.8)
-    ax.plot(y_pred, label="Predicted", color="red", linewidth=0.8, alpha=0.8)
-    ax.set_ylabel("Close Price")
-    ax.set_title("Price Overlay")
-    ax.legend(loc="upper right")
-    ax.grid(True, alpha=0.3)
-
-    # Bottom: Residuals
-    ax = axes[1]
-    residuals = y_true - y_pred
-    ax.axhline(y=0, color="black", linewidth=0.5, linestyle="--")
-    ax.plot(residuals, color="purple", linewidth=0.5, alpha=0.7)
-    ax.set_ylabel("Residual (Actual - Pred)")
-    ax.set_xlabel("Test Sample Index")
-    ax.set_title(
-        "Residuals (μ={mean:.6f}, σ={std:.6f})".format(
-            mean=residuals.mean(), std=residuals.std()
-        )
-    )
-    ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    path = "{plot_dir}/{name}_predictions.png".format(
-        plot_dir=PLOT_DIR, name=model_name.lower().replace(" ", "_")
-    )
-    plt.savefig(path, dpi=150)
-    plt.close()
-    print("Saved plot:", path)
-    return path
-
-
-def plot_residual_hist(
-    y_true: np.ndarray, y_pred: np.ndarray, model_name: str = "model"
-) -> str:
-    """Plot histogram of residuals (prediction errors).
-
-    Returns:
-        Path to saved PNG.
-    """
-    residuals = y_true - y_pred
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.hist(residuals, bins=80, color="steelblue", edgecolor="white", alpha=0.8)
-    ax.axvline(x=0, color="red", linewidth=1, linestyle="--")
-    ax.set_xlabel("Prediction Error (Actual — Predicted)")
-    ax.set_ylabel("Frequency")
-    ax.set_title(
-        "{name} — Residual Distribution\n(μ={mean:.6f}, σ={std:.6f})".format(
-            name=model_name, mean=residuals.mean(), std=residuals.std()
-        )
-    )
-    ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    path = "{plot_dir}/{name}_residual_hist.png".format(
-        plot_dir=PLOT_DIR, name=model_name.lower().replace(" ", "_")
-    )
-    plt.savefig(path, dpi=150)
-    plt.close()
-    print("Saved plot:", path)
-    return path
-```
-
-**Verify:**
-```bash
-cd /home/bob/Documents/git/fp-ml && .venv/bin/python3 -c "from src.evaluate import compute_metrics, plot_predictions; print('OK')"
-```
-
-**Expected:** `OK`
-
----
-
-# PHASE 9: MODEL COMPARISON
-
----
-
-## Task 9.1: Create `src/compare.py`
-
-**Create:** `src/compare.py`
-
-```python
-"""Compare all 3 models: metrics table, bar charts, CSV export."""
-import json
-import csv
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from src.config import METRIC_DIR, PLOT_DIR
-
-
-def plot_metrics_bar(all_metrics: list) -> str:
-    """Side-by-side bar chart comparing RMSE, MAE, R², DirAcc across models."""
-    models = [m["model"] for m in all_metrics]
-    rmse_vals = [m["rmse"] for m in all_metrics]
-    mae_vals = [m["mae"] for m in all_metrics]
-    r2_vals = [m["r2"] for m in all_metrics]
-    dir_vals = [m["directional_accuracy_pct"] for m in all_metrics]
-
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle("Model Comparison — USD/CHF Forecasting", fontsize=16, fontweight="bold")
-
-    colors = ["#2196F3", "#4CAF50", "#FF9800"]
-
-    # RMSE
-    axes[0, 0].bar(models, rmse_vals, color=colors)
-    axes[0, 0].set_title("RMSE (lower is better)")
-    axes[0, 0].set_ylabel("RMSE")
-    for bar, val in zip(axes[0, 0].patches, rmse_vals):
-        axes[0, 0].text(
-            bar.get_x() + bar.get_width() / 2, bar.get_height(),
-            "{:.6f}".format(val), ha="center", va="bottom", fontsize=9,
-        )
-
-    # MAE
-    axes[0, 1].bar(models, mae_vals, color=colors)
-    axes[0, 1].set_title("MAE (lower is better)")
-    axes[0, 1].set_ylabel("MAE")
-    for bar, val in zip(axes[0, 1].patches, mae_vals):
-        axes[0, 1].text(
-            bar.get_x() + bar.get_width() / 2, bar.get_height(),
-            "{:.6f}".format(val), ha="center", va="bottom", fontsize=9,
-        )
-
-    # R²
-    axes[1, 0].bar(models, r2_vals, color=colors)
-    axes[1, 0].set_title("R² Score (higher is better)")
-    axes[1, 0].set_ylabel("R²")
-    for bar, val in zip(axes[1, 0].patches, r2_vals):
-        axes[1, 0].text(
-            bar.get_x() + bar.get_width() / 2, bar.get_height(),
-            "{:.4f}".format(val), ha="center", va="bottom", fontsize=9,
-        )
-
-    # Directional Accuracy
-    axes[1, 1].bar(models, dir_vals, color=colors)
-    axes[1, 1].set_title("Directional Accuracy % (higher is better)")
-    axes[1, 1].set_ylabel("%")
-    axes[1, 1].axhline(y=50, color="gray", linewidth=0.5, linestyle="--", label="Random")
-    axes[1, 1].legend()
-    for bar, val in zip(axes[1, 1].patches, dir_vals):
-        axes[1, 1].text(
-            bar.get_x() + bar.get_width() / 2, bar.get_height(),
-            "{:.1f}%".format(val), ha="center", va="bottom", fontsize=9,
-        )
-
-    plt.tight_layout()
-    path = PLOT_DIR + "/model_comparison_metrics.png"
-    plt.savefig(path, dpi=150)
-    plt.close()
-    print("Saved:", path)
-    return path
-
-
-def save_metrics(all_metrics: list) -> str:
-    """Save all metrics as JSON and CSV."""
-    # JSON
-    json_path = METRIC_DIR + "/all_metrics.json"
-    with open(json_path, "w") as f:
-        json.dump(all_metrics, f, indent=2, default=str)
-    print("Saved:", json_path)
-
-    # CSV
-    csv_path = METRIC_DIR + "/all_metrics.csv"
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=all_metrics[0].keys())
-        writer.writeheader()
-        writer.writerows(all_metrics)
-    print("Saved:", csv_path)
-    return json_path
-
-
-if __name__ == "__main__":
-    # Test with dummy data
-    test_metrics = [
-        {
-            "model": "KNN Regressor", "rmse": 0.0005, "mae": 0.0003,
-            "mape_pct": 0.05, "r2": 0.95, "directional_accuracy_pct": 51.2,
-            "n_samples": 56000,
-        },
-        {
-            "model": "SVR", "rmse": 0.0008, "mae": 0.0005,
-            "mape_pct": 0.08, "r2": 0.88, "directional_accuracy_pct": 50.5,
-            "n_samples": 56000,
-        },
-        {
-            "model": "XGBoost Regressor", "rmse": 0.0004, "mae": 0.0002,
-            "mape_pct": 0.04, "r2": 0.97, "directional_accuracy_pct": 53.1,
-            "n_samples": 56000,
-        },
-    ]
-    plot_metrics_bar(test_metrics)
-    save_metrics(test_metrics)
-    print("Compare module OK")
-```
-
-**Verify:**
-```bash
-cd /home/bob/Documents/git/fp-ml && .venv/bin/python3 -m src.compare
-```
-
-**Expected:** Creates PNG, JSON, CSV. Prints "Compare module OK".
-
----
-
-# PHASE 10: MASTER PIPELINE RUNNER
-
----
-
-## Task 10.1: Create `src/run_all.py`
-
-**Create:** `src/run_all.py`
-
-```python
-#!/usr/bin/env python3
-"""Master pipeline: load → features → split → scale → train 3 → evaluate → compare.
-
-Usage:
-    .venv/bin/python3 -m src.run_all
-"""
-from src.data_loader import load_data
-from src.feature_engineering import build_features, scale_features
-from src.data_splitting import split_data
-from src.train_knn import train_knn
-from src.train_svr import train_svr
-from src.train_xgboost import train_xgboost
-from src.evaluate import compute_metrics, plot_predictions, plot_residual_hist
-from src.compare import plot_metrics_bar, save_metrics
-
-
-def main():
-    print("=" * 70)
-    print("  USD/CHF FOREX FORECASTING — 3 MODEL COMPARISON")
-    print("  KNN Regressor  |  SVR  |  XGBoost Regressor")
-    print("=" * 70)
-
-    # ── 1. Load & Build Features ──
-    print("\n[1/7] Loading data...")
-    df = load_data()
-    print("       Loaded: {n:,} rows".format(n=len(df)))
-
-    print("\n[2/7] Building features...")
-    df = build_features(df)
-    print("       Feature-built: {n:,} rows".format(n=len(df)))
-
-    # ── 2. Split ──
-    print("\n[3/7] Splitting data (chronological)...")
-    X_tr, X_v, X_te, y_tr, y_v, y_te, feats = split_data(df)
-    print("       {n} features".format(n=len(feats)))
-
-    # ── 3. Scale ──
-    print("\n[4/7] Scaling features (StandardScaler)...")
-    X_tr_s, X_v_s, X_te_s, _ = scale_features(X_tr, X_v, X_te)
-
-    # ── 4. Train 3 Models ──
-    all_metrics = []
-
-    print("\n[5a/7] Training KNN Regressor...")
-    knn_model = train_knn(X_tr_s, y_tr)
-    knn_pred = knn_model.predict(X_te_s)
-    knn_metrics = compute_metrics(y_te, knn_pred, "KNN Regressor")
-    plot_predictions(y_te, knn_pred, "KNN Regressor")
-    plot_residual_hist(y_te, knn_pred, "KNN Regressor")
-    all_metrics.append(knn_metrics)
-
-    print("\n[5b/7] Training SVR...")
-    svr_model = train_svr(X_tr_s, y_tr)
-    svr_pred = svr_model.predict(X_te_s)
-    svr_metrics = compute_metrics(y_te, svr_pred, "SVR")
-    plot_predictions(y_te, svr_pred, "SVR")
-    plot_residual_hist(y_te, svr_pred, "SVR")
-    all_metrics.append(svr_metrics)
-
-    print("\n[5c/7] Training XGBoost Regressor...")
-    xgb_model = train_xgboost(X_tr_s, y_tr, X_v_s, y_v)
-    xgb_pred = xgb_model.predict(X_te_s)
-    xgb_metrics = compute_metrics(y_te, xgb_pred, "XGBoost Regressor")
-    plot_predictions(y_te, xgb_pred, "XGBoost Regressor")
-    plot_residual_hist(y_te, xgb_pred, "XGBoost Regressor")
-    all_metrics.append(xgb_metrics)
-
-    # ── 5. Compare ──
-    print("\n[6/7] Generating comparison report...")
-    save_metrics(all_metrics)
-    plot_metrics_bar(all_metrics)
-
-    # ── 6. Summary ──
-    print("\n[7/7] ====== FINAL COMPARISON ======")
-    header = "{:<20} {:>10} {:>10} {:>8} {:>8} {:>8}".format(
-        "Model", "RMSE", "MAE", "MAPE%", "R²", "DirAcc%"
-    )
-    print(header)
-    print("-" * 70)
-    for m in all_metrics:
-        print("{:<20} {:>10.6f} {:>10.6f} {:>8.4f} {:>8.4f} {:>8.2f}".format(
-            m["model"], m["rmse"], m["mae"], m["mape_pct"], m["r2"],
-            m["directional_accuracy_pct"],
-        ))
-
-    print("\n✅ Pipeline complete!")
-    print("   Models:  outputs/models/")
-    print("   Plots:   outputs/plots/")
-    print("   Metrics: outputs/metrics/")
-
-
-if __name__ == "__main__":
-    main()
-```
-
-**Verify (dry run — load + features only):**
-```bash
-cd /home/bob/Documents/git/fp-ml && .venv/bin/python3 -c "
-from src.data_loader import load_data
-from src.feature_engineering import build_features, scale_features
-from src.data_splitting import split_data
-df = load_data()
-df = build_features(df)
-X_tr, X_v, X_te, y_tr, y_v, y_te, feats = split_data(df)
-X_tr_s, X_v_s, X_te_s, _ = scale_features(X_tr, X_v, X_te)
-print('Pipeline OK. Train:', X_tr_s.shape, 'Test:', X_te_s.shape)
-"
-```
-
-**Expected:** `Pipeline OK. Train: (~410000, 48) Test: (~56000, 48)`
-
----
-
-# PHASE 11: QUICK VALIDATION SCRIPT
-
----
-
-## Task 11.1: Create `src/validate_quick.sh`
-
-**Create:** `src/validate_quick.sh`
-
-```bash
-#!/usr/bin/env bash
-# Quick validation: train all 3 models on a 20K sample
-# to verify the pipeline works before full training.
-
-set -e
-cd "$(dirname "$0")/.."
-PY=.venv/bin/python3
-
-echo "=== QUICK VALIDATION (20K subsample) ==="
-
-$PY -c "
-from src.data_loader import load_data
-from src.feature_engineering import build_features, scale_features
-from src.data_splitting import split_data
-from sklearn.neighbors import KNeighborsRegressor
-from sklearn.svm import SVR
-from xgboost import XGBRegressor
-import numpy as np
-
-# Load last 20K rows for recency
-df = load_data().iloc[-20000:]
-df = build_features(df)
-X_tr, X_v, X_te, y_tr, y_v, y_te, feats = split_data(df)
-X_tr_s, X_v_s, X_te_s, _ = scale_features(X_tr, X_v, X_te)
-
-# Train mini models
-for name, model in [
-    ('KNN', KNeighborsRegressor(n_neighbors=5)),
-    ('SVR', SVR(C=1.0, gamma='scale', epsilon=0.01)),
-    ('XGBoost', XGBRegressor(n_estimators=50, max_depth=3, verbosity=0)),
-]:
-    model.fit(X_tr_s, y_tr)
-    pred = model.predict(X_te_s)
-    rmse = np.sqrt(((y_te - pred)**2).mean())
-    mae = np.abs(y_te - pred).mean()
-    print('{:.<10} RMSE={:.6f}  MAE={:.6f}'.format(name, rmse, mae))
-
-print('✅ Quick validation PASSED — pipeline works!')
-"
-```
-
-Make executable:
-```bash
-chmod +x src/validate_quick.sh
-```
-
-**Verify:**
-```bash
-cd /home/bob/Documents/git/fp-ml && bash src/validate_quick.sh
-```
-
-**Expected:** 3 lines with RMSE/MAE. Takes <60 seconds.
-
----
-
-# MASTER EXECUTION CHECKLIST
-
-| Step | Action | Command | Est. Time |
-|------|--------|---------|-----------|
-| 1 | Install deps | `.venv/bin/uv pip install scikit-learn xgboost matplotlib seaborn` | 2 min |
-| 2 | Create dirs | `mkdir -p src outputs/models outputs/plots outputs/metrics` | instant |
-| 3 | Write src/__init__.py | — | instant |
-| 4 | Write src/config.py | — | instant |
-| 5 | Write src/data_loader.py | — | instant |
-| 6 | Test loader | `.venv/bin/python3 -m src.data_loader` | 5 sec |
-| 7 | Write src/feature_engineering.py | — | instant |
-| 8 | Test features | `.venv/bin/python3 -c "..." ` (see verify above) | 30 sec |
-| 9 | Write src/data_splitting.py | — | instant |
-| 10 | Test split | `.venv/bin/python3 -m src/data_splitting` | 5 sec |
-| 11 | Write src/train_knn.py | — | instant |
-| 12 | Write src/train_svr.py | — | instant |
-| 13 | Write src/train_xgboost.py | — | instant |
-| 14 | Write src/evaluate.py | — | instant |
-| 15 | Write src/compare.py | — | instant |
-| 16 | Write src/run_all.py | — | instant |
-| 17 | Quick validate | `bash src/validate_quick.sh` | 1 min |
-| 18 | **FULL RUN** | `.venv/bin/python3 -m src.run_all` | 30-90 min |
-
----
-
-# RISKS & MITIGATIONS
-
-| Risk | Mitigation |
-|------|-----------|
-| SVR O(n²) — training hangs | Subsampling to 50K rows via `subsample()` |
-| All models predict naive (close_t ≈ close_t+1) | Directional accuracy catches this. DirAcc ≈ 50% = no edge |
-| KNN predict slow on large test set | 56K test rows × ~10K train neighbors = fast |
-| XGBoost grid: 3×4×3×3×3 = 324 combos | Only 3 CV folds via TimeSeriesSplit |
-| Fish shell can't `source activate` | All commands use `.venv/bin/python3` directly |
-| Volume column all zeros | Dropped in `data_loader.py` |
-| Price data non-stationary | Lags + returns + rolling stats handle this |
-| matplotlib needs display | `matplotlib.use("Agg")` in all plotting code |
-
----
-
-# DELIVERABLES
-
-1. **`src/`** — 10 Python modules
-2. **`outputs/models/`** — 3 trained model files
-3. **`outputs/plots/`** — 7 PNG plots
-4. **`outputs/metrics/`** — `all_metrics.json` + `all_metrics.csv`
-
----
-
-# GIT COMMIT
-
-```bash
-cd /home/bob/Documents/git/fp-ml
-git add src/ outputs/ .hermes/
-git commit -m "feat: KNN, SVR, XGBoost forex forecasting pipeline — 3 model comparison"
-```
+Output directories: Create outputs/preprocessed/, outputs/models/, outputs/plots/ with os.makedirs(exist_ok=True) at notebook startup to avoid file-not-found errors mid-pipeline.
