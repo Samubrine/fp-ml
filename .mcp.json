@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "ipynb": {
+      "command": "/home/bob/Documents/git/fp-ml/.venv-torch/bin/python3",
+      "args": [
+        "-m", "cursor_notebook_mcp.server",
+        "--allow-root", "/home/bob/Documents/git/fp-ml",
+        "--transport", "stdio",
+        "--log-dir", "/home/bob/Documents/git/fp-ml/.mcp-logs"
+      ]
+    },
+    "bifrost": {
+      "type": "http",
+      "url": "https://bifrost.adriel.my.id/mcp",
+      "headers": {
+        "Authorization": "Bearer sk-bf-ed0b14a6-a113-4db0-8c8e-b639976c2dd6"
+      }
+    }
+  }
+}

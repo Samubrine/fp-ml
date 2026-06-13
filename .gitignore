@@ -1,0 +1,19 @@
+# Data files (too large)
+data/
+
+# Output (generated models/plots)
+outputs/
+
+# Hermes plans
+.hermes/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS
+.DS_Store
+
+# Reasonix
+.reasonix
