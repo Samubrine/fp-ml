@@ -10,28 +10,21 @@ import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 
-RAW_DIR = "data/raw/ascii"
-OUT_DIR = "data/processed"
+OUT_DIR = "data/usdchf"
 OUT_FILE = os.path.join(OUT_DIR, "USDCHF_1min_2020_2026.csv")
-os.makedirs(RAW_DIR, exist_ok=True)
 os.makedirs(OUT_DIR, exist_ok=True)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 }
 BASE = "https://www.histdata.com"
-
-# Years to download
-# 2026: use monthly (current year, only Jan-May available)
-# 2020-2025: use yearly ASCII (available as single zip per year)
-YEARS = list(range(2020, 2026))  # 2020-2025 yearly
-MONTHS_2026 = range(1, 6)  # Jan-May 2026
+YEARS = list(range(2020, 2026))
+MONTHS_2026 = range(1, 6)
 
 
 def download_yearly_ascii(year):
-    """Download yearly ASCII zip for a given year."""
     fname = f"HISTDATA_COM_ASCII_USDCHF_M1_{year}.zip"
-    fpath = os.path.join(RAW_DIR, fname)
+    fpath = os.path.join(OUT_DIR, fname)
     if os.path.exists(fpath) and os.path.getsize(fpath) > 0:
         print(f"  SKIP {year} (exists)")
         return fpath
@@ -74,9 +67,8 @@ def download_yearly_ascii(year):
 
 
 def download_month_ascii(year, month):
-    """Download individual month ASCII zip for current year."""
     fname = f"USDCHF_{year}_{month:02d}.zip"
-    fpath = os.path.join(RAW_DIR, fname)
+    fpath = os.path.join(OUT_DIR, fname)
     if os.path.exists(fpath) and os.path.getsize(fpath) > 0:
         print(f"  SKIP {year}-{month:02d} (exists)")
         return fpath
@@ -119,7 +111,6 @@ def download_month_ascii(year, month):
 
 
 def parse_ascii_csv(text):
-    """Parse ASCII format CSV: YYYYMMDD HHMMSS;open;high;low;close;volume"""
     df = pd.read_csv(
         StringIO(text),
         sep=";",
@@ -135,7 +126,6 @@ def parse_ascii_csv(text):
 
 
 def process_zip(fpath):
-    """Process a single ASCII zip file -> DataFrame."""
     with zipfile.ZipFile(fpath) as z:
         csv_name = [n for n in z.namelist() if n.endswith(".csv")][0]
         text = z.read(csv_name).decode("utf-8")
@@ -144,8 +134,6 @@ def process_zip(fpath):
 
 def main():
     frames = []
-
-    # 1) Download & process yearly ASCII zips (2020-2025)
     for year in YEARS:
         fpath = download_yearly_ascii(year)
         if fpath:
@@ -154,7 +142,6 @@ def main():
             frames.append(df)
             print(f"{len(df):,} rows")
 
-    # 2) Download & process monthly ASCII zips for 2026 (Jan-May)
     for month in MONTHS_2026:
         fpath = download_month_ascii(2026, month)
         if fpath:
@@ -167,12 +154,16 @@ def main():
         print("No data downloaded!")
         return
 
-    # Combine
     full = pd.concat(frames)
     full.sort_index(inplace=True)
     full = full[~full.index.duplicated(keep="first")]
 
     full.to_csv(OUT_FILE)
+    # Clean up zips after successful merge
+    for f in os.listdir(OUT_DIR):
+        if f.endswith(".zip"):
+            os.remove(os.path.join(OUT_DIR, f))
+
     print(f"\n=== DONE ===")
     print(f"Written: {OUT_FILE}")
     print(f"Rows:    {len(full):,}")
